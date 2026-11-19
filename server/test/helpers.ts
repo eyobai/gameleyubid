@@ -70,7 +70,7 @@ export async function createApp(env: Record<string, string> = {}): Promise<TestA
 export async function resetDb(prisma: PrismaService): Promise<void> {
   // Append-only triggers would refuse DELETE; TRUNCATE does not fire them.
   await prisma.$executeRawUnsafe(
-    'TRUNCATE audit_logs, provider_events, deposits, bets, rounds, seed_chains, ledger_entries, journals, ledger_accounts, refresh_tokens, users CASCADE',
+    'TRUNCATE audit_logs, provider_events, deposits, chat_messages, bets, rounds, seed_chains, ledger_entries, journals, ledger_accounts, refresh_tokens, users CASCADE',
   );
 }
 

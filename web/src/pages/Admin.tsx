@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '../auth';
 import { ApiError, api, newKey } from '../lib/api';
 import { fromMinor, group, toMinor, x } from '../lib/money';
-import type { Bet } from './Game';
+import type { Bet } from '../game/live';
 
 interface Period { flights: number; rounds: number; players: number; playerWinRate: number | null; bets: string; payouts: string; revenue: string; revenueMinor: string; holdRate: number | null }
 interface Summary {
@@ -15,6 +15,7 @@ interface Summary {
 interface AdminBet extends Bet { phoneNumber: string; bet: string; payout: string | null }
 interface ReserveMove { reference: string; type: string; reason: string | null; change: string; balanceAfter: string; createdAt: string }
 interface Recon { ok: boolean; trialBalanceMinor: string; accountMismatches: unknown[]; betsWithWrongPayout: number }
+interface ChatRow { id: string; userId: string; phoneNumber: string; mutedUntil: string | null; text: string; hidden: boolean; createdAt: string }
 interface Player { id: string; phoneNumber: string; status: string; balance: string; createdAt: string }
 
 const pct = (v: number | null) => (v === null ? '–' : `${(v * 100).toFixed(2)}%`);
@@ -28,6 +29,7 @@ export function Admin() {
   const [moves, setMoves] = useState<ReserveMove[]>([]);
   const [recon, setRecon] = useState<Recon | null>(null);
   const [players, setPlayers] = useState<Player[]>([]);
+  const [chat, setChat] = useState<ChatRow[]>([]);
   const [amount, setAmount] = useState('');
   const [reason, setReason] = useState('');
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
@@ -37,6 +39,7 @@ export function Admin() {
     void api<{ items: AdminBet[] }>('/admin/bets?limit=50').then((r) => setFlights(r.items)).catch(() => undefined);
     void api<{ items: ReserveMove[] }>('/admin/reserve/history').then((r) => setMoves(r.items)).catch(() => undefined);
     if (isAdmin) void api<{ items: Player[] }>('/admin/players').then((r) => setPlayers(r.items)).catch(() => undefined);
+    if (isAdmin) void api<{ items: ChatRow[] }>('/admin/chat').then((r) => setChat(r.items)).catch(() => undefined);
   }, [isAdmin]);
 
   useEffect(() => {
@@ -68,6 +71,15 @@ export function Admin() {
   const block = async (p: Player) => {
     const path = p.status === 'BLOCKED' ? 'unblock' : 'block';
     await api(`/admin/players/${p.id}/${path}`, { method: 'POST', body: { reason: `${path} from admin page` } }).catch(() => undefined);
+    load();
+  };
+
+  const hide = async (id: string) => {
+    await api(`/admin/chat/${id}/hide`, { method: 'POST' }).catch(() => undefined);
+    load();
+  };
+  const mute = async (userId: string, muted: boolean) => {
+    await api(`/admin/chat/players/${userId}/${muted ? 'unmute' : 'mute'}`, { method: 'POST', body: muted ? undefined : { minutes: 24 * 60, reason: 'Muted from the admin page' } }).catch(() => undefined);
     load();
   };
 
@@ -160,7 +172,7 @@ export function Admin() {
               {flights.map((f) => (
                 <tr key={f.id}>
                   <td>{new Date(f.createdAt).toLocaleTimeString()}</td><td className="num">{f.roundNumber}</td><td>{f.phoneNumber}</td><td className="num">{group(f.bet)}</td><td className="num">{x(f.capX100)}</td>
-                  <td>{f.status === 'OPEN' ? <span className="pill wait">flying</span> : f.status === 'CASHED_OUT' ? <span className="pill good">{f.cashoutReason?.toLowerCase()} {x(f.cashoutX100!)}</span> : <span className="pill bad">popped</span>}</td>
+                  <td>{f.status === 'OPEN' ? <span className="pill wait">flying</span> : f.status === 'CASHED_OUT' ? <span className="pill good">{f.cashoutReason?.toLowerCase()} {x(f.cashoutX100!)}</span> : f.status === 'CANCELLED' ? <span className="pill">cancelled</span> : <span className="pill bad">popped</span>}</td>
                   <td className="num">{f.crashX100 ? x(f.crashX100) : '–'}</td><td className="num">{group(f.payout)}</td>
                 </tr>
               ))}
@@ -168,6 +180,34 @@ export function Admin() {
           </table>
         </div>
       </section>
+
+      {isAdmin && (
+        <section className="card">
+          <h2>Chat</h2>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>When</th><th>Player</th><th>Message</th><th></th></tr></thead>
+              <tbody>
+                {chat.length === 0 && <tr><td colSpan={4} className="muted">No messages yet.</td></tr>}
+                {chat.map((m) => {
+                  const muted = !!m.mutedUntil && Date.parse(m.mutedUntil) > Date.now();
+                  return (
+                    <tr key={m.id}>
+                      <td>{new Date(m.createdAt).toLocaleTimeString()}</td>
+                      <td>{m.phoneNumber}{muted && <> <span className="pill bad">muted</span></>}</td>
+                      <td style={{ whiteSpace: 'normal', opacity: m.hidden ? 0.5 : 1 }}>{m.hidden ? <s>{m.text}</s> : m.text}</td>
+                      <td className="row" style={{ flexWrap: 'nowrap' }}>
+                        {!m.hidden && <button className="btn" type="button" onClick={() => hide(m.id)}>Hide</button>}
+                        <button className="btn" type="button" onClick={() => mute(m.userId, muted)}>{muted ? 'Unmute' : 'Mute 24 h'}</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {isAdmin && (
         <section className="card">

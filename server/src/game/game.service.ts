@@ -21,6 +21,7 @@ type BetWithRound = Bet & { round: Round };
 
 export interface BetDto {
   id: string;
+  slot: number;
   roundId: string;
   roundNumber: number;
   status: BetStatus;
@@ -124,7 +125,7 @@ export class GameService {
    * reserve limit: when the round's possible winnings would pass the total limit, the shared cap comes down and
    * everyone still flying is cashed out together there.
    */
-  async placeBet(user: AuthUser, betMinor: bigint, autoX100: number | null, key: string): Promise<{ bet: BetDto; replayed: boolean }> {
+  async placeBet(user: AuthUser, betMinor: bigint, autoX100: number | null, key: string, slot = 1): Promise<{ bet: BetDto; replayed: boolean }> {
     if (!this.config.game.enabled) {
       throw new AppException(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.GAME_DISABLED, 'The game is closed right now');
     }
@@ -137,7 +138,7 @@ export class GameService {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`bet:${user.id}:${key}`}, 0))::text`;
       const earlier = await tx.bet.findUnique({ where: { userId_idempotencyKey: { userId: user.id, idempotencyKey: key } }, include: { round: true } });
       if (earlier) {
-        if (earlier.betMinor !== betMinor || earlier.autoCashoutX100 !== autoX100) {
+        if (earlier.betMinor !== betMinor || earlier.autoCashoutX100 !== autoX100 || earlier.slot !== slot) {
           throw new AppException(HttpStatus.UNPROCESSABLE_ENTITY, ErrorCode.IDEMPOTENCY_KEY_REUSED, 'This idempotency key was already used for a different bet');
         }
         return { bet: this.toDto(earlier), replayed: true };
@@ -151,8 +152,8 @@ export class GameService {
       if (!round || now >= round.startsAt) {
         throw new AppException(HttpStatus.CONFLICT, ErrorCode.BETTING_CLOSED, 'Betting for this round has closed. The next round opens in a moment.');
       }
-      if (await tx.bet.count({ where: { roundId: round.id, userId: user.id } })) {
-        throw new AppException(HttpStatus.CONFLICT, ErrorCode.ALREADY_IN_ROUND, 'You already have a bet in this round');
+      if (await tx.bet.count({ where: { roundId: round.id, userId: user.id, slot, status: { not: BetStatus.CANCELLED } } })) {
+        throw new AppException(HttpStatus.CONFLICT, ErrorCode.ALREADY_IN_ROUND, `You already have bet ${slot} in this round`);
       }
 
       const wallet = await this.ledger.wallet(tx, user.id);
@@ -175,12 +176,8 @@ export class GameService {
       }
       const personalCapX100 = capFor(betMinor, limits.flightLimitMinor, this.risk.maxMultiplierX100);
 
-      // Room for this round: the total limit, minus whatever bets of other rounds could still cost (normally none).
-      const [other] = await tx.$queryRaw<{ risk: bigint }[]>`
-        SELECT COALESCE(SUM(max_payout_minor - bet_minor), 0)::bigint AS risk FROM bets WHERE status = 'OPEN' AND round_id <> ${round.id}::uuid`;
-      const base = state.reserveMinor - state.openBetsMinor;
-      const room = (base * BigInt(this.risk.totalRiskBps)) / 10000n - other.risk;
-      const inRound = await tx.bet.findMany({ where: { roundId: round.id }, select: { betMinor: true, personalCapX100: true } });
+      const room = await this.roundRoom(tx, round.id, state);
+      const inRound = await tx.bet.findMany({ where: { roundId: round.id, status: BetStatus.OPEN }, select: { betMinor: true, personalCapX100: true } });
       const cap = roundCap([...inRound, { betMinor, personalCapX100 }], room, this.risk.maxMultiplierX100);
       if (cap === 'FULL') {
         throw new AppException(HttpStatus.CONFLICT, ErrorCode.ROUND_FULL, 'This round is full. Try the next one.');
@@ -199,6 +196,7 @@ export class GameService {
           roundId: round.id,
           userId: user.id,
           idempotencyKey: key,
+          slot,
           betMinor,
           autoCashoutX100: autoX100,
           personalCapX100,
@@ -207,17 +205,8 @@ export class GameService {
           betJournalId: posted.journal.id,
         },
       });
-      if (cap !== round.capX100) {
-        await tx.round.update({ where: { id: round.id }, data: { capX100: cap } });
-        await tx.$executeRaw`
-          UPDATE bets SET cap_x100 = LEAST(personal_cap_x100, ${cap ?? this.risk.maxMultiplierX100}),
-                          max_payout_minor = bet_minor * LEAST(personal_cap_x100, ${cap ?? this.risk.maxMultiplierX100}) / 100
-          WHERE round_id = ${round.id}::uuid AND status = 'OPEN'`;
-      }
-
-      // Last line of defence: the reserve must hold every open bet's largest payout.
-      const after = await this.reserveState(tx);
-      if (after.reserveMinor < after.committedMinor) throw new Error('Reserve would not cover open bets');
+      if (cap !== round.capX100) await this.applyRoundCap(tx, round.id, cap);
+      await this.assertCovered(tx);
 
       const bet = await tx.bet.findUniqueOrThrow({ where: { id: created.id }, include: { round: true } });
       this.liveCache = null;
@@ -239,6 +228,71 @@ export class GameService {
     }, MONEY_TX);
   }
 
+  /** Withdraws a bet before lift-off and returns it in full. The round's shared limit is worked out again. */
+  async cancelBet(user: AuthUser, betId: string): Promise<BetDto> {
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM game_state WHERE id = 1 FOR UPDATE`;
+      const found = await tx.bet.findFirst({ where: { id: betId, userId: user.id }, select: { roundId: true } });
+      if (!found) throw notFound('Bet not found');
+      await tx.$queryRaw`SELECT id FROM rounds WHERE id = ${found.roundId}::uuid FOR UPDATE`;
+      const bet = await this.lockBet(tx, betId, user.id);
+      if (!bet) throw notFound('Bet not found');
+      const now = await this.now(tx);
+      if (bet.status !== BetStatus.OPEN) {
+        throw new AppException(HttpStatus.CONFLICT, ErrorCode.BET_SETTLED, 'This bet is already settled', { bet: this.toDto(bet) });
+      }
+      if (bet.round.status !== RoundStatus.BETTING || now >= bet.round.startsAt) {
+        throw new AppException(HttpStatus.CONFLICT, ErrorCode.BETTING_CLOSED, 'The balloon has lifted off: cash out instead');
+      }
+      const reserve = await this.ledger.system(tx, AccountType.GAME_RESERVE);
+      const wallet = await this.ledger.wallet(tx, bet.userId);
+      const posted = await this.ledger.transfer(tx, reserve, wallet, bet.betMinor, {
+        type: JournalType.BET_CANCEL,
+        idempotencyKey: `cancel:${bet.id}`,
+        description: `Updraft bet cancelled, round ${bet.round.number}`,
+        createdById: user.id,
+        metadata: { betId: bet.id, roundId: bet.roundId },
+      });
+      await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.CANCELLED, settledAt: now, cancelJournalId: posted.journal.id } });
+
+      // With this bet gone the round may need a higher shared limit, or none.
+      const state = await this.reserveState(tx);
+      const room = await this.roundRoom(tx, bet.roundId, state);
+      const left = await tx.bet.findMany({ where: { roundId: bet.roundId, status: BetStatus.OPEN }, select: { betMinor: true, personalCapX100: true } });
+      const cap = left.length ? roundCap(left, room, this.risk.maxMultiplierX100) : null;
+      if (cap === 'FULL') throw new Error('A round became full by removing a bet');
+      if (cap !== bet.round.capX100) await this.applyRoundCap(tx, bet.roundId, cap);
+      await this.assertCovered(tx);
+
+      this.liveCache = null;
+      return this.toDto(await tx.bet.findUniqueOrThrow({ where: { id: bet.id }, include: { round: true } }));
+    }, MONEY_TX);
+  }
+
+  /** What a round's bets may cost the house in total: the round share of the base, minus other rounds' open bets. */
+  private async roundRoom(tx: Tx, roundId: string, state: ReserveState): Promise<bigint> {
+    const [other] = await tx.$queryRaw<{ risk: bigint }[]>`
+      SELECT COALESCE(SUM(max_payout_minor - bet_minor), 0)::bigint AS risk FROM bets WHERE status = 'OPEN' AND round_id <> ${roundId}::uuid`;
+    const base = state.reserveMinor - state.openBetsMinor;
+    return (base * BigInt(this.risk.totalRiskBps)) / 10000n - other.risk;
+  }
+
+  /** Sets a round's shared limit and every open bet's cap and largest payout to match. */
+  private async applyRoundCap(tx: Tx, roundId: string, cap: number | null): Promise<void> {
+    const limit = cap ?? this.risk.maxMultiplierX100;
+    await tx.round.update({ where: { id: roundId }, data: { capX100: cap } });
+    await tx.$executeRaw`
+      UPDATE bets SET cap_x100 = LEAST(personal_cap_x100, ${limit}),
+                      max_payout_minor = bet_minor * LEAST(personal_cap_x100, ${limit}) / 100
+      WHERE round_id = ${roundId}::uuid AND status = 'OPEN'`;
+  }
+
+  /** Last line of defence: the reserve must hold every open bet's largest payout. */
+  private async assertCovered(tx: Tx): Promise<void> {
+    const after = await this.reserveState(tx);
+    if (after.reserveMinor < after.committedMinor) throw new Error('Reserve would not cover open bets');
+  }
+
   async getBet(user: AuthUser, id: string): Promise<BetDto> {
     return this.prisma.$transaction(async (tx) => {
       const bet = await this.lockBet(tx, id, user.id);
@@ -249,7 +303,7 @@ export class GameService {
 
   async listMine(userId: string, limit = 20) {
     const bets = await this.prisma.bet.findMany({
-      where: { userId },
+      where: { userId, status: { not: BetStatus.CANCELLED } },
       include: { round: true },
       orderBy: { createdAt: 'desc' },
       take: Math.min(Math.max(limit, 1), 100),
@@ -259,16 +313,17 @@ export class GameService {
 
   // ───────────────────────────── What everyone sees ─────────────────────────────
 
-  /** The current round, everyone in it, recent pop points, and the caller's own bet. */
+  /** The current round, everyone in it, recent pop points, and the caller's own bets (up to two). */
   async live(userId: string) {
     const shared = await this.sharedLive();
-    let me: BetDto | null = null;
+    let mine: BetDto[] = [];
     if (shared.round) {
-      const mine = await this.prisma.bet.findUnique({
-        where: { roundId_userId: { roundId: shared.round.id, userId } },
+      const rows = await this.prisma.bet.findMany({
+        where: { roundId: shared.round.id, userId, status: { not: BetStatus.CANCELLED } },
         include: { round: true },
+        orderBy: { slot: 'asc' },
       });
-      me = mine ? this.toDto(mine) : null;
+      mine = rows.map((b) => this.toDto(b));
     }
     const serverTime = new Date();
     const round = shared.round && {
@@ -277,7 +332,7 @@ export class GameService {
       multiplierX100:
         shared.round.status === RoundStatus.FLYING ? multiplierAt(serverTime.getTime() - Date.parse(shared.round.startsAt)) : null,
     };
-    return { round, me, history: shared.history };
+    return { round, mine, history: shared.history };
   }
 
   private async sharedLive() {
@@ -288,7 +343,7 @@ export class GameService {
     let live: LiveRound | null = null;
     if (round) {
       const bets = await this.prisma.bet.findMany({
-        where: { roundId: round.id },
+        where: { roundId: round.id, status: { not: BetStatus.CANCELLED } },
         include: { user: { select: { phoneNumber: true } } },
         orderBy: [{ betMinor: 'desc' }, { createdAt: 'asc' }],
       });
@@ -341,6 +396,28 @@ export class GameService {
         edgeBps: r.edgeBps,
         crashX100: r.crashX100.toString(),
         endedAt: r.endedAt?.toISOString() ?? null,
+      })),
+    };
+  }
+
+  /** Biggest wins, by multiplier or by amount, over a day, a month or a year. Players are masked. */
+  async top(by: 'multiplier' | 'win', period: 'day' | 'month' | 'year') {
+    const since = new Date(Date.now() - { day: 1, month: 30, year: 365 }[period] * 86_400_000);
+    const rows = await this.prisma.bet.findMany({
+      where: { status: BetStatus.CASHED_OUT, settledAt: { gte: since } },
+      include: { round: true, user: { select: { phoneNumber: true } } },
+      orderBy: by === 'multiplier' ? [{ cashoutX100: 'desc' }, { payoutMinor: 'desc' }] : [{ payoutMinor: 'desc' }, { cashoutX100: 'desc' }],
+      take: 20,
+    });
+    return {
+      items: rows.map((b) => ({
+        player: maskPhone(b.user.phoneNumber),
+        roundNumber: b.round.number,
+        betMinor: b.betMinor.toString(),
+        cashoutX100: b.cashoutX100,
+        payoutMinor: b.payoutMinor?.toString() ?? null,
+        crashX100: b.round.status === RoundStatus.ENDED ? b.round.crashX100.toString() : null,
+        settledAt: b.settledAt?.toISOString() ?? null,
       })),
     };
   }
@@ -540,6 +617,7 @@ export class GameService {
     const ended = b.round.status === RoundStatus.ENDED;
     return {
       id: b.id,
+      slot: b.slot,
       roundId: b.roundId,
       roundNumber: b.round.number,
       status: b.status,

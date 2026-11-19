@@ -68,10 +68,10 @@ describe('a shared round', () => {
     expect(seenByA.body.round.crashX100).toBeNull();
     expect(seenByA.body.round.seed).toBeNull();
     expect(seenByA.body.round.players[0].player).toMatch(/^\+2519\*+\d\d$/);
-    expect(seenByA.body.me.betMinor).toBe('5000');
+    expect(seenByA.body.mine[0].betMinor).toBe('5000');
     const seenByB = await live(b.token);
     expect(seenByB.body.round.id).toBe(seenByA.body.round.id);
-    expect(seenByB.body.me.betMinor).toBe('4000');
+    expect(seenByB.body.mine[0].betMinor).toBe('4000');
 
     await liftOff(round.id, msToReach(200) + 30);
     const late = await player(t);
@@ -80,7 +80,7 @@ describe('a shared round', () => {
 
     // B's auto cash-out at 1.50× was due before 2.00×: the engine pays it.
     await t.game.tick();
-    const aBet = (await live(a.token)).body.me;
+    const aBet = (await live(a.token)).body.mine[0];
     const out = await t.http().post(`/api/v1/game/bets/${aBet.id}/cash-out`).set(auth(a.token)).expect(200);
     expect(out.body.status).toBe('CASHED_OUT');
     expect(out.body.cashoutX100).toBeGreaterThanOrEqual(200);
@@ -114,7 +114,7 @@ describe('a shared round', () => {
     await forceCrash(round.id, 150n);
     await bet(p.token, '5000');
     await liftOff(round.id, msToReach(160));
-    const me = (await live(p.token)).body.me;
+    const me = (await live(p.token)).body.mine[0];
     const out = await t.http().post(`/api/v1/game/bets/${me.id}/cash-out`).set(auth(p.token)).expect(200);
     expect(out.body.status).toBe('BUSTED');
     expect(await balance(t, p.token)).toBe(5_000n);
@@ -133,7 +133,7 @@ describe('a shared round', () => {
     expect(early.body.error).toBe('CASHOUT_TOO_EARLY');
   });
 
-  it('takes one bet per player per round, replays retries and refuses what the wallet cannot cover', async () => {
+  it('takes two bets per player per round, replays retries and refuses what the wallet cannot cover', async () => {
     const p = await player(t);
     await credit(t, p.id, 10_000n);
     await openRound();
@@ -141,12 +141,64 @@ describe('a shared round', () => {
     const [x, y] = await Promise.all([bet(p.token, '3000', {}, k), bet(p.token, '3000', {}, k)]);
     expect(x.body.id).toBe(y.body.id);
     expect((await bet(p.token, '3000')).body.error).toBe('ALREADY_IN_ROUND');
-    expect(await balance(t, p.token)).toBe(7_000n);
+    const second = await bet(p.token, '2000', { slot: 2, autoCashoutX100: 150 });
+    expect(second.status).toBe(201);
+    expect(second.body.slot).toBe(2);
+    expect((await bet(p.token, '1000', { slot: 2 })).body.error).toBe('ALREADY_IN_ROUND');
+    expect((await bet(p.token, '1000', { slot: 3 })).status).toBe(400);
+    const mine = (await live(p.token)).body.mine;
+    expect(mine.map((b: { slot: number }) => b.slot)).toEqual([1, 2]);
+    expect(await balance(t, p.token)).toBe(5_000n);
 
     const q = await player(t);
     await credit(t, q.id, 1_000n);
     expect((await bet(q.token, '5000')).body.error).toBe('INSUFFICIENT_FUNDS');
     expect(await t.prisma.bet.count({ where: { userId: q.id } })).toBe(0);
+  });
+
+  it('lets a bet be cancelled before lift-off, frees its slot and returns the money', async () => {
+    const p = await player(t);
+    await credit(t, p.id, 10_000n);
+    const round = await openRound();
+    const placed = await bet(p.token, '4000');
+    const cancelled = await t.http().post(`/api/v1/game/bets/${placed.body.id}/cancel`).set(auth(p.token)).expect(200);
+    expect(cancelled.body.status).toBe('CANCELLED');
+    expect(await balance(t, p.token)).toBe(10_000n);
+    expect((await live(p.token)).body.round.playerCount).toBe(0);
+    const again = await bet(p.token, '2500');
+    expect(again.status).toBe(201);
+    await liftOff(round.id, 0);
+    const late = await t.http().post(`/api/v1/game/bets/${again.body.id}/cancel`).set(auth(p.token));
+    expect(late.body.error).toBe('BETTING_CLOSED');
+    expect((await reconcile(t, finance.token)).ok).toBe(true);
+  });
+
+  it('raises the shared limit again when a bet is cancelled', async () => {
+    const players = await Promise.all(Array.from({ length: 20 }, () => player(t)));
+    await Promise.all(players.map((p) => credit(t, p.id, 100_000n)));
+    const round = await openRound();
+    const placed = await Promise.all(players.map((p) => bet(p.token, '100000')));
+    // 20,000 bet against 10,000 of room → 1.50×.
+    expect((await t.prisma.round.findUniqueOrThrow({ where: { id: round.id } })).capX100).toBe(150);
+    await Promise.all(players.slice(0, 10).map((p, i) => t.http().post(`/api/v1/game/bets/${placed[i].body.id}/cancel`).set(auth(p.token)).expect(200)));
+    // 10,000 left: everyone fits at their own 2.00× cap, so no shared limit.
+    expect((await t.prisma.round.findUniqueOrThrow({ where: { id: round.id } })).capX100).toBeNull();
+    const open = await t.prisma.bet.findMany({ where: { roundId: round.id, status: 'OPEN' } });
+    expect(open.every((b) => b.capX100 === 200 && b.maxPayoutMinor === 200_000n)).toBe(true);
+  });
+
+  it('lists the biggest wins with players masked', async () => {
+    const p = await player(t);
+    await credit(t, p.id, 10_000n);
+    const round = await openRound();
+    await forceCrash(round.id, 900n);
+    await bet(p.token, '1000', { autoCashoutX100: 500 });
+    await liftOff(round.id, msToReach(900) + 10);
+    await t.game.tick();
+    await t.game.tick();
+    const top = await t.http().get('/api/v1/game/top?by=multiplier&period=day').expect(200);
+    expect(top.body.items[0]).toMatchObject({ cashoutX100: 500, payoutMinor: '5000', crashX100: '900' });
+    expect(top.body.items[0].player).toMatch(/^\+2519\*+\d\d$/);
   });
 
   it('refuses staff and bets outside the limits', async () => {
@@ -271,6 +323,40 @@ describe('when switched off', () => {
     } finally {
       await off.close();
     }
+  });
+});
+
+describe('chat', () => {
+  const say = (token: string, text: string) => t.http().post('/api/v1/chat').set(auth(token)).send({ text });
+
+  it('is open to players who have played, with links refused, a pace limit, hiding and muting', async () => {
+    const p = await player(t);
+    await credit(t, p.id, 10_000n);
+    expect((await say(p.token, 'hello')).body.error).toBe('CHAT_LOCKED');
+
+    const round = await openRound();
+    await forceCrash(round.id, 100n);
+    await bet(p.token, '1000');
+    await liftOff(round.id, 10);
+    await t.game.tick();
+
+    expect((await say(p.token, 'first win soon')).status).toBe(201);
+    expect((await say(p.token, 'again')).body.error).toBe('RATE_LIMITED');
+    await t.prisma.$executeRaw`UPDATE chat_messages SET created_at = created_at - interval '10 seconds'`;
+    expect((await say(p.token, 'free signals t.me/scam')).body.error).toBe('CHAT_REFUSED');
+
+    const other = await player(t);
+    const seen = await t.http().get('/api/v1/chat').set(auth(other.token)).expect(200);
+    expect(seen.body.items).toHaveLength(1);
+    expect(seen.body.items[0]).toMatchObject({ text: 'first win soon', mine: false });
+    expect(seen.body.items[0].player).toMatch(/^\+2519\*+\d\d$/);
+
+    const admin = await staff(t, 'ADMIN');
+    expect((await t.http().post(`/api/v1/admin/chat/${seen.body.items[0].id}/hide`).set(auth(finance.token))).status).toBe(403);
+    await t.http().post(`/api/v1/admin/chat/${seen.body.items[0].id}/hide`).set(auth(admin.token)).expect(201);
+    expect((await t.http().get('/api/v1/chat').set(auth(other.token))).body.items).toHaveLength(0);
+    await t.http().post(`/api/v1/admin/chat/players/${p.id}/mute`).set(auth(admin.token)).send({ minutes: 60, reason: 'Spam' }).expect(201);
+    expect((await say(p.token, 'let me talk')).body.error).toBe('CHAT_MUTED');
   });
 });
 

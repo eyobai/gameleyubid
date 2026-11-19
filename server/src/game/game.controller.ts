@@ -16,7 +16,7 @@ import {
   Res,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
 import type { Response } from 'express';
 import { CurrentUser, IdempotencyKey, Public } from '../common/auth';
 import type { AuthUser } from '../common/auth';
@@ -35,6 +35,23 @@ class PlaceBetDto {
   @IsInt()
   @Min(101)
   autoCashoutX100?: number;
+
+  /** 1 or 2: a player can have two bets in the same round. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(2)
+  slot?: number;
+}
+
+class TopQuery {
+  @IsOptional()
+  @IsIn(['multiplier', 'win'])
+  by?: 'multiplier' | 'win';
+
+  @IsOptional()
+  @IsIn(['day', 'month', 'year'])
+  period?: 'day' | 'month' | 'year';
 }
 
 class LimitQuery {
@@ -86,7 +103,7 @@ export class GameController {
 
   @Post('bets')
   async place(@CurrentUser() user: AuthUser, @Body() dto: PlaceBetDto, @IdempotencyKey() key: string, @Res({ passthrough: true }) res: Response) {
-    const { bet, replayed } = await this.game.placeBet(user, BigInt(dto.betMinor), dto.autoCashoutX100 ?? null, key);
+    const { bet, replayed } = await this.game.placeBet(user, BigInt(dto.betMinor), dto.autoCashoutX100 ?? null, key, dto.slot ?? 1);
     if (replayed) res.setHeader('Idempotent-Replayed', 'true');
     return bet;
   }
@@ -105,6 +122,20 @@ export class GameController {
   @Post('bets/:id/cash-out')
   cashOut(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
     return this.game.cashOut(user, id);
+  }
+
+  /** Withdraws a bet before lift-off and returns it in full. */
+  @HttpCode(HttpStatus.OK)
+  @Post('bets/:id/cancel')
+  cancel(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.game.cancelBet(user, id);
+  }
+
+  /** Biggest wins, by multiplier or amount, over a day, month or year. */
+  @Public()
+  @Get('top')
+  top(@Query() q: TopQuery) {
+    return this.game.top(q.by ?? 'win', q.period ?? 'day');
   }
 
   /** Ended rounds with their seeds. */

@@ -6,6 +6,7 @@ import { AdminController } from './admin/admin.controller';
 import { AuthController } from './auth/auth.controller';
 import { AuthService } from './auth/auth.service';
 import { AuthGuard } from './common/auth';
+import { AdminChatController, ChatController } from './chat/chat.controller';
 import { AllExceptionsFilter } from './common/exception.filter';
 import { APP_CONFIG, loadConfig } from './config/config';
 import type { AppConfig } from './config/config';
@@ -47,6 +48,8 @@ export function buildAppModule(config: AppConfig = loadConfig()) {
       ChapaHooksController,
       GameController,
       AdminController,
+      ChatController,
+      AdminChatController,
     ],
     providers: [
       { provide: APP_CONFIG, useValue: config },

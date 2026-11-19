@@ -78,6 +78,22 @@ Everyone plays the same rounds and sees the same balloon:
    request, if the balloon hasn't popped. Cash-out opens at 1.01×.
 4. **Pop.** Bets still flying are lost. The round's seed is revealed and the next round opens.
 
+**What players can do in a round:**
+- **Two bets at once.** Each player has two bet panels (`slot` 1 and 2), for example one safe bet with auto cash-out at
+  1.5× and one left to ride.
+- **Cancel** a bet before lift-off (`POST /game/bets/:id/cancel`). It's returned in full and the slot is free again.
+- **Bet on the next round** while one is flying. The site places the bet as soon as betting opens.
+- **Auto bet** repeats the same bet every round, with optional auto cash-out. It stops as soon as a bet can't be
+  placed, for example when the balance runs out. Auto bet runs in the player's browser, so nothing is placed while
+  they're away.
+- **Quick amounts**, + / − steps, and sound effects that can be switched on and off.
+- **All bets / My bets / Top:** the current round's bets, the player's own history, and the biggest wins or
+  multipliers of the day, month or year (`GET /game/top`).
+- **Chat** (`/chat`) for players who have played at least one round:
+  - links, usernames and phone numbers are refused, which stops scam "signals"
+  - one message every 3 seconds
+  - admins can hide messages and mute players, and every action is recorded in the audit log
+
 The **round engine** runs every 100 ms (`GAME_TICK_MS`):
 - it pays auto cash-outs and limit cash-outs at their exact multiplier, so a player who closes the page is still paid
 - it ends rounds and opens the next one
@@ -182,4 +198,3 @@ The container applies pending migrations at start.
 - **Amharic translation** of the site.
 - **Live updates over WebSocket.** The site checks the server about 3 times a second, which is fine for hundreds of
   players. Thousands at once would call for a WebSocket push instead.
-- **Betting on the next round** while one is flying. Today players wait for the betting window.

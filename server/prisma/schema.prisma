@@ -27,6 +27,8 @@ model User {
   passwordHash String        @map("password_hash")
   role         Role          @default(PLAYER)
   status       AccountStatus @default(ACTIVE)
+  /// Set by staff: the player cannot post in chat until then.
+  chatMutedUntil DateTime?   @map("chat_muted_until") @db.Timestamptz(3)
   createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
 
@@ -34,6 +36,7 @@ model User {
   account       LedgerAccount?
   bets          Bet[]
   deposits      Deposit[]
+  chatMessages  ChatMessage[]
 
   @@map("users")
 }
@@ -79,6 +82,7 @@ model LedgerAccount {
 enum JournalType {
   DEPOSIT
   BET
+  BET_CANCEL // a bet withdrawn before lift-off, returned in full
   PAYOUT
   RESERVE_FUNDING
   RESERVE_WITHDRAWAL
@@ -183,6 +187,7 @@ enum BetStatus {
   OPEN
   CASHED_OUT
   BUSTED
+  CANCELLED // withdrawn before lift-off; the bet was returned
 }
 
 /// One player's bet in one round.
@@ -191,6 +196,8 @@ model Bet {
   roundId          String    @map("round_id") @db.Uuid
   userId           String    @map("user_id") @db.Uuid
   idempotencyKey   String    @map("idempotency_key") @db.VarChar(100)
+  /// A player may have two bets in a round, in slot 1 and slot 2.
+  slot             Int       @default(1) @db.SmallInt
   betMinor         BigInt    @map("bet_minor")
   autoCashoutX100  Int?      @map("auto_cashout_x100")
   personalCapX100  Int       @map("personal_cap_x100") // this bet's own reserve limit
@@ -205,12 +212,14 @@ model Bet {
   createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   betJournalId     String    @unique @map("bet_journal_id") @db.Uuid
   payoutJournalId  String?   @unique @map("payout_journal_id") @db.Uuid
+  cancelJournalId  String?   @unique @map("cancel_journal_id") @db.Uuid
 
   round Round @relation(fields: [roundId], references: [id])
   user  User  @relation(fields: [userId], references: [id])
 
-  @@unique([roundId, userId])
+  // One live bet per player and slot in a round: a partial unique index in SQL (cancelled bets do not count).
   @@unique([userId, idempotencyKey])
+  @@index([roundId])
   @@index([userId, createdAt])
   @@index([status, settleAt])
   @@map("bets")
@@ -267,4 +276,20 @@ model AuditLog {
 
   @@index([createdAt])
   @@map("audit_logs")
+}
+
+/// Players' chat next to the game. Staff can hide a message; hidden ones are kept for the record.
+model ChatMessage {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  text      String    @db.VarChar(200)
+  hiddenAt  DateTime? @map("hidden_at") @db.Timestamptz(3)
+  hiddenBy  String?   @map("hidden_by") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@map("chat_messages")
 }
