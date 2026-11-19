@@ -1,36 +1,44 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 
 /**
- * Provably fair pop points. This file is the published specification: anyone can recompute a flight with it.
+ * Provably fair pop points for shared rounds. This file is the published specification.
  *
- *   h      = first 52 bits (13 hex digits) of HMAC-SHA256(key = serverSeed, message = `${clientSeed}:${nonce}`)
+ * Seeds come from a hash chain made before any round is played:
+ *   seed[L] = random; seed[i - 1] = SHA-256(seed[i]); commitment = seed[0], published in advance.
+ * Round i of the chain uses seed[i] and reveals it when the round ends. Anyone can check SHA-256(seed[i]) equals
+ * the seed of the round before (the commitment for i = 1). Since SHA-256 cannot be reversed, every future seed
+ * was fixed the moment the commitment was published.
+ *
+ *   h      = first 52 bits (13 hex digits) of HMAC-SHA256(key = seed, message = salt)
  *   E      = 2^52
  *   crash  = floor( (10000 - edgeBps) * E / (100 * (E - h)) ), at least 100
  *
- * `crash` is the multiplier times 100 (250 = 2.50×). For any m, P(crash >= m) = (1 - edge) / (m / 100): with a 3% edge
- * a 2.00× target is reached 48.5% of the time, and every strategy returns 97% of what is bet over time.
- * Cash-outs start at 1.01×, so flights with crash = 100 are lost to everyone: about 4% with a 3% edge.
- *
- * The server seed is random and kept secret while it is in use; its SHA-256 hash is shown to the player before
- * the first bet with it. When the player retires the pair, the seed is revealed so every past flight can be checked.
+ * `crash` is the multiplier ×100 (250 = 2.50×). For any m, P(crash >= m) = (1 - edge) / (m / 100): with a 3% edge
+ * a 2.00× target is reached 48.5% of the time and every strategy returns 97% of what is bet over time.
+ * Cash-outs start at 1.01×, so a round with crash = 100 is lost to everyone: about 4% of rounds.
  */
 
 const E = 2n ** 52n;
 
-export function crashPointX100(serverSeed: string, clientSeed: string, nonce: number, edgeBps: number): bigint {
+export const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+
+export function crashFromDigest(hexDigest: string, edgeBps: number): bigint {
   if (!Number.isInteger(edgeBps) || edgeBps < 0 || edgeBps >= 10000) throw new RangeError('edgeBps must be 0..9999');
-  if (!Number.isInteger(nonce) || nonce < 0) throw new RangeError('nonce must be a non-negative integer');
-  const digest = createHmac('sha256', serverSeed).update(`${clientSeed}:${nonce}`).digest('hex');
-  const h = BigInt(`0x${digest.slice(0, 13)}`);
+  const h = BigInt(`0x${hexDigest.slice(0, 13)}`);
   const crash = (BigInt(10000 - edgeBps) * E) / (100n * (E - h));
   return crash < 100n ? 100n : crash;
 }
 
-export const hashSeed = (serverSeed: string): string => createHash('sha256').update(serverSeed).digest('hex');
+export function roundCrashX100(seed: string, salt: string, edgeBps: number): bigint {
+  return crashFromDigest(createHmac('sha256', seed).update(salt).digest('hex'), edgeBps);
+}
 
-export const newServerSeed = (): string => randomBytes(32).toString('hex');
+/** seed[index] of a chain whose last seed is `topSeed`: hash it (length - index) times. */
+export function chainSeed(topSeed: string, length: number, index: number): string {
+  if (!Number.isInteger(index) || index < 0 || index > length) throw new RangeError('index outside the chain');
+  let seed = topSeed;
+  for (let i = length; i > index; i--) seed = sha256(seed);
+  return seed;
+}
 
-export const newClientSeed = (): string => randomBytes(8).toString('hex');
-
-/** Client seeds are short printable text the player may choose. */
-export const CLIENT_SEED_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+export const newTopSeed = (): string => randomBytes(32).toString('hex');

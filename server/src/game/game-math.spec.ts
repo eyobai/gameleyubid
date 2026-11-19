@@ -1,31 +1,35 @@
 import { createHmac } from 'node:crypto';
-import { crashPointX100, hashSeed } from './fairness';
+import { chainSeed, roundCrashX100, sha256 } from './fairness';
 import { msToReach, multiplierAt, payoutFor, plannedOutcome } from './flight-math';
-import { capFor, checkBet, currentLimits } from './risk';
+import { capFor, checkBet, currentLimits, roundCap, roundRisk } from './risk';
 import type { RiskSettings } from './risk';
 
-describe('crash points', () => {
-  it('is deterministic for the same seeds and nonce', () => {
-    expect(crashPointX100('a'.repeat(64), 'player', 7, 300)).toBe(crashPointX100('a'.repeat(64), 'player', 7, 300));
-    expect(crashPointX100('a'.repeat(64), 'player', 7, 300)).not.toBe(crashPointX100('a'.repeat(64), 'player', 8, 300));
-  });
-
+describe('round pop points', () => {
   it('follows the published formula', () => {
     const seed = 'f'.repeat(64);
-    const h = BigInt('0x' + createHmac('sha256', seed).update('abc:3').digest('hex').slice(0, 13));
+    const h = BigInt('0x' + createHmac('sha256', seed).update('salt').digest('hex').slice(0, 13));
     const e = 2n ** 52n;
     const expected = (9700n * e) / (100n * (e - h));
-    expect(crashPointX100(seed, 'abc', 3, 300)).toBe(expected < 100n ? 100n : expected);
+    expect(roundCrashX100(seed, 'salt', 300)).toBe(expected < 100n ? 100n : expected);
+  });
+
+  it('chains seeds so each one hashes to the one before', () => {
+    const top = 'a'.repeat(64);
+    const s5 = chainSeed(top, 10, 5);
+    expect(sha256(s5)).toBe(chainSeed(top, 10, 4));
+    expect(chainSeed(top, 10, 10)).toBe(top);
+    let x = chainSeed(top, 10, 3);
+    for (let i = 0; i < 3; i++) x = sha256(x);
+    expect(x).toBe(chainSeed(top, 10, 0));
   });
 
   it('reaches each target about (1 - edge) / target of the time', () => {
     const n = 200_000;
-    const seed = hashSeed('distribution');
     let at1 = 0;
     let at2 = 0;
     let at10 = 0;
     for (let i = 0; i < n; i++) {
-      const c = crashPointX100(seed, 'client', i, 300);
+      const c = roundCrashX100(sha256(`round-${i}`), 'salt', 300);
       if (c === 100n) at1++;
       if (c >= 200n) at2++;
       if (c >= 1000n) at10++;
@@ -34,6 +38,27 @@ describe('crash points', () => {
     expect(at10 / n).toBeCloseTo(0.097, 2);
     // Everything below 1.01× counts as an instant pop: 1 - 0.97 / 1.01 ≈ 3.96%.
     expect(at1 / n).toBeCloseTo(0.0396, 2);
+  });
+});
+
+describe('shared round limit', () => {
+  const bet = (betMinor: bigint, personalCapX100 = 100000) => ({ betMinor, personalCapX100 });
+
+  it('needs no limit while everyone fits at their own cap', () => {
+    expect(roundCap([bet(100_000n, 200), bet(100_000n, 200)], 1_000_000n, 100000)).toBeNull();
+  });
+
+  it('cashes everyone out together when the round would cost too much', () => {
+    // 50 bets of 1,000 against 10,000 of room: 50,000 × (cap - 1) <= 10,000 → cap 1.20×.
+    const bets = Array.from({ length: 50 }, () => bet(100_000n, 200));
+    expect(roundCap(bets, 1_000_000n, 100000)).toBe(120);
+    expect(roundRisk(bets, 120)).toBeLessThanOrEqual(1_000_000n);
+    expect(roundRisk(bets, 121)).toBeGreaterThan(1_000_000n);
+  });
+
+  it('is full when even 1.01× does not fit', () => {
+    const bets = Array.from({ length: 200 }, () => bet(100_000n, 200));
+    expect(roundCap(bets, 100_000n, 100000)).toBe('FULL');
   });
 });
 
@@ -157,7 +182,7 @@ describe('reserve limits', () => {
       const r = checkBet(bet, state, s);
       if (!r.ok) throw new Error('refused');
       reserve += bet;
-      const crash = crashPointX100('stress', 'p', seedN++, 300);
+      const crash = roundCrashX100(sha256(`stress-${seedN++}`), 'salt', 300);
       const o = plannedOutcome(crash, r.capX100, null);
       if (o.kind === 'WIN') reserve -= payoutFor(bet, o.atX100);
       expect(reserve).toBeGreaterThan(0n);

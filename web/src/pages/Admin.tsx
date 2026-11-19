@@ -2,18 +2,19 @@ import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '../auth';
 import { ApiError, api, newKey } from '../lib/api';
 import { fromMinor, group, toMinor, x } from '../lib/money';
-import type { Flight } from './Game';
+import type { Bet } from './Game';
 
-interface Period { flights: number; players: number; playerWinRate: number | null; bets: string; payouts: string; revenue: string; revenueMinor: string; holdRate: number | null }
+interface Period { flights: number; rounds: number; players: number; playerWinRate: number | null; bets: string; payouts: string; revenue: string; revenueMinor: string; holdRate: number | null }
 interface Summary {
   currency: string;
   settings: { enabled: boolean; edgeBps: number; flightRiskBps: number; totalRiskBps: number; maxMultiplierX100: number };
   reserve: { balance: string; committed: string; free: string; openFlights: number; openRisk: string; maxBetNow: string };
+  currentRound: { number: number; status: string; players: number; capX100: number | null } | null;
   results: Record<'last24h' | 'last7d' | 'last30d' | 'allTime', Period>;
 }
-interface AdminFlight extends Flight { phoneNumber: string; bet: string; payout: string | null; crash: string | null }
+interface AdminBet extends Bet { phoneNumber: string; bet: string; payout: string | null }
 interface ReserveMove { reference: string; type: string; reason: string | null; change: string; balanceAfter: string; createdAt: string }
-interface Recon { ok: boolean; trialBalanceMinor: string; accountMismatches: unknown[]; flightsWithWrongPayout: number }
+interface Recon { ok: boolean; trialBalanceMinor: string; accountMismatches: unknown[]; betsWithWrongPayout: number }
 interface Player { id: string; phoneNumber: string; status: string; balance: string; createdAt: string }
 
 const pct = (v: number | null) => (v === null ? '–' : `${(v * 100).toFixed(2)}%`);
@@ -23,7 +24,7 @@ export function Admin() {
   const { session } = useAuth();
   const isAdmin = session?.user.role === 'ADMIN';
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [flights, setFlights] = useState<AdminFlight[]>([]);
+  const [flights, setFlights] = useState<AdminBet[]>([]);
   const [moves, setMoves] = useState<ReserveMove[]>([]);
   const [recon, setRecon] = useState<Recon | null>(null);
   const [players, setPlayers] = useState<Player[]>([]);
@@ -33,7 +34,7 @@ export function Admin() {
 
   const load = useCallback(() => {
     void api<Summary>('/admin/summary').then(setSummary).catch(() => undefined);
-    void api<{ items: AdminFlight[] }>('/admin/flights?limit=50').then((r) => setFlights(r.items)).catch(() => undefined);
+    void api<{ items: AdminBet[] }>('/admin/bets?limit=50').then((r) => setFlights(r.items)).catch(() => undefined);
     void api<{ items: ReserveMove[] }>('/admin/reserve/history').then((r) => setMoves(r.items)).catch(() => undefined);
     if (isAdmin) void api<{ items: Player[] }>('/admin/players').then((r) => setPlayers(r.items)).catch(() => undefined);
   }, [isAdmin]);
@@ -80,14 +81,15 @@ export function Admin() {
         <h1>House reserve</h1>
         <div className="stats">
           <div className="stat"><span className="lbl">Reserve</span><b>{group(summary.reserve.balance)}</b></div>
-          <div className="stat"><span className="lbl">Promised to open flights</span><b>{group(summary.reserve.committed)}</b></div>
+          <div className="stat"><span className="lbl">Promised to open bets</span><b>{group(summary.reserve.committed)}</b></div>
           <div className="stat"><span className="lbl">Free</span><b>{group(summary.reserve.free)}</b></div>
-          <div className="stat"><span className="lbl">Open flights</span><b>{summary.reserve.openFlights}</b></div>
+          <div className="stat"><span className="lbl">Open bets</span><b>{summary.reserve.openFlights}</b></div>
+          <div className="stat"><span className="lbl">Current round</span><b>{summary.currentRound ? `#${summary.currentRound.number} · ${summary.currentRound.players} in` : '–'}</b></div>
           <div className="stat"><span className="lbl">Max bet right now</span><b>{group(summary.reserve.maxBetNow)}</b></div>
         </div>
         <p className="hint" style={{ margin: 0 }}>
-          Edge {s.edgeBps / 100}% · one bet can cost at most {s.flightRiskBps / 100}% of the reserve · all open flights at most{' '}
-          {s.totalRiskBps / 100}% of the reserve · highest multiplier {x(s.maxMultiplierX100)}. Withdrawals can never touch money promised to open flights.
+          Edge {s.edgeBps / 100}% · one bet can cost at most {s.flightRiskBps / 100}% of the reserve · a whole round at most{' '}
+          {s.totalRiskBps / 100}% (everyone is cashed out together at the round's limit) · highest multiplier {x(s.maxMultiplierX100)}. Withdrawals can never touch money promised to open bets.
         </p>
       </section>
 
@@ -109,7 +111,7 @@ export function Admin() {
           </div>
           {recon ? (
             <p className={recon.ok ? 'ok' : 'error'} style={{ margin: 0 }}>
-              {recon.ok ? 'Every balance matches its ledger lines and the books balance.' : `Problem: ${recon.accountMismatches.length} account mismatches, ${recon.flightsWithWrongPayout} flights with a wrong payout, trial balance ${recon.trialBalanceMinor}.`}
+              {recon.ok ? 'Every balance matches its ledger lines and the books balance.' : `Problem: ${recon.accountMismatches.length} account mismatches, ${recon.betsWithWrongPayout} bets with a wrong payout, trial balance ${recon.trialBalanceMinor}.`}
             </p>
           ) : (
             <p className="hint" style={{ margin: 0 }}>Recomputes every balance from the ledger and checks that debits equal credits.</p>
@@ -132,13 +134,13 @@ export function Admin() {
         <h2>Results</h2>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Period</th><th className="num">Flights</th><th className="num">Players</th><th className="num">Bets</th><th className="num">Paid to players</th><th className="num">House revenue</th><th className="num">Kept</th><th className="num">Player win rate</th></tr></thead>
+            <thead><tr><th>Period</th><th className="num">Rounds</th><th className="num">Bets</th><th className="num">Players</th><th className="num">Amount bet</th><th className="num">Paid to players</th><th className="num">House revenue</th><th className="num">Kept</th><th className="num">Player win rate</th></tr></thead>
             <tbody>
               {PERIODS.map(([key, label]) => {
                 const r = summary.results[key];
                 return (
                   <tr key={key}>
-                    <td>{label}</td><td className="num">{r.flights}</td><td className="num">{r.players}</td><td className="num">{group(r.bets)}</td><td className="num">{group(r.payouts)}</td>
+                    <td>{label}</td><td className="num">{r.rounds}</td><td className="num">{r.flights}</td><td className="num">{r.players}</td><td className="num">{group(r.bets)}</td><td className="num">{group(r.payouts)}</td>
                     <td className={`num ${r.revenueMinor.startsWith('-') ? 'lo' : 'hi'}`}>{group(r.revenue)}</td><td className="num">{pct(r.holdRate)}</td><td className="num">{pct(r.playerWinRate)}</td>
                   </tr>
                 );
@@ -150,16 +152,16 @@ export function Admin() {
       </section>
 
       <section className="card">
-        <h2>Recent flights</h2>
+        <h2>Recent bets</h2>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Started</th><th>Player</th><th className="num">Bet</th><th className="num">Limit</th><th>Result</th><th className="num">Popped at</th><th className="num">Paid</th></tr></thead>
+            <thead><tr><th>Placed</th><th className="num">Round</th><th>Player</th><th className="num">Bet</th><th className="num">Limit</th><th>Result</th><th className="num">Popped at</th><th className="num">Paid</th></tr></thead>
             <tbody>
               {flights.map((f) => (
                 <tr key={f.id}>
-                  <td>{new Date(f.startedAt).toLocaleTimeString()}</td><td>{f.phoneNumber}</td><td className="num">{group(f.bet)}</td><td className="num">{x(f.capX100)}</td>
+                  <td>{new Date(f.createdAt).toLocaleTimeString()}</td><td className="num">{f.roundNumber}</td><td>{f.phoneNumber}</td><td className="num">{group(f.bet)}</td><td className="num">{x(f.capX100)}</td>
                   <td>{f.status === 'OPEN' ? <span className="pill wait">flying</span> : f.status === 'CASHED_OUT' ? <span className="pill good">{f.cashoutReason?.toLowerCase()} {x(f.cashoutX100!)}</span> : <span className="pill bad">popped</span>}</td>
-                  <td className="num">{f.crash ? `${f.crash}×` : '–'}</td><td className="num">{group(f.payout)}</td>
+                  <td className="num">{f.crashX100 ? x(f.crashX100) : '–'}</td><td className="num">{group(f.payout)}</td>
                 </tr>
               ))}
             </tbody>

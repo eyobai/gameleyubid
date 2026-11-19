@@ -79,3 +79,36 @@ export function checkBet(betMinor: bigint, state: ReserveState, s: RiskSettings)
   if (state.reserveMinor + betMinor - state.committedMinor - maxPayoutMinor < 0n) return { ok: false, reason: 'ABOVE_MAX', limits };
   return { ok: true, capX100, maxPayoutMinor };
 }
+
+export interface RoundBet {
+  betMinor: bigint;
+  personalCapX100: number;
+}
+
+/** What a round's bets could cost the house if everyone were paid at `capX100` (or their own lower cap). */
+export function roundRisk(bets: RoundBet[], capX100: number): bigint {
+  let total = 0n;
+  for (const b of bets) {
+    const cap = b.personalCapX100 < capX100 ? b.personalCapX100 : capX100;
+    total += (b.betMinor * BigInt(cap - 100)) / 100n;
+  }
+  return total;
+}
+
+/**
+ * The shared limit of a round: the highest multiplier at which everyone can still be paid while the round's total
+ * cost to the house stays within `roomMinor`. Null when no limit is needed (everyone fits at their own cap), and
+ * 'FULL' when even 1.01× does not fit, so the newest bet must be refused.
+ */
+export function roundCap(bets: RoundBet[], roomMinor: bigint, maxMultiplierX100: number): number | null | 'FULL' {
+  if (roundRisk(bets, maxMultiplierX100) <= roomMinor) return null;
+  if (roundRisk(bets, 101) > roomMinor) return 'FULL';
+  let lo = 101; // fits
+  let hi = maxMultiplierX100; // does not fit
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (roundRisk(bets, mid) <= roomMinor) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}

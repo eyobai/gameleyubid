@@ -2,11 +2,11 @@
 export const GROWTH_PER_SECOND = 0.12;
 export const multiplierAt = (ms: number) => (ms <= 0 ? 100 : Math.floor(100 * Math.exp((GROWTH_PER_SECOND * ms) / 1000)));
 
-/** The published pop-point formula, recomputed in the browser with Web Crypto. */
-export async function crashPointX100(serverSeed: string, clientSeed: string, nonce: number, edgeBps: number): Promise<bigint> {
+/** The published pop-point formula for a round, recomputed in the browser with Web Crypto. */
+export async function roundCrashX100(seed: string, salt: string, edgeBps: number): Promise<bigint> {
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(serverSeed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(`${clientSeed}:${nonce}`)));
+  const key = await crypto.subtle.importKey('raw', enc.encode(seed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(salt)));
   const hex = Array.from(sig, (b) => b.toString(16).padStart(2, '0')).join('');
   const h = BigInt(`0x${hex.slice(0, 13)}`);
   const e = 2n ** 52n;

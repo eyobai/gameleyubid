@@ -9,7 +9,7 @@ import { AuthGuard } from './common/auth';
 import { AllExceptionsFilter } from './common/exception.filter';
 import { APP_CONFIG, loadConfig } from './config/config';
 import type { AppConfig } from './config/config';
-import { GameController, SettlementWorker } from './game/game.controller';
+import { GameController, RoundEngine } from './game/game.controller';
 import { GameService } from './game/game.service';
 import { HealthController } from './health.controller';
 import { LedgerService } from './ledger/ledger.service';
@@ -56,7 +56,7 @@ export function buildAppModule(config: AppConfig = loadConfig()) {
       AuthService,
       LedgerService,
       GameService,
-      SettlementWorker,
+      RoundEngine,
       ChapaClient,
       PaymentsService,
     ],

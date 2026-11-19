@@ -1,7 +1,7 @@
 # Updraft
 
-A cash-out game for a LeyuBid subdomain (for example `game.leyubid.com`). A player bets, a balloon rises while a
-multiplier climbs, and the player cashes out before it pops to win bet × multiplier.
+A multiplayer cash-out game for a LeyuBid subdomain (for example `game.leyubid.com`). Everyone bets on the same
+balloon; it rises while a multiplier climbs, and players cash out before it pops to win bet × multiplier.
 
 Updraft is a separate product. It has its own accounts, wallet, Chapa deposits and database, and shares no code or
 data with LeyuBid.
@@ -55,34 +55,43 @@ cd ../web && npm test # browser fairness check matches the server formula
 ```
 
 The integration tests cover:
-- cash-outs, pops and auto cash-outs
-- limit cash-outs settled by the background job
-- the player and the job racing to settle the same flight (it pays once)
-- retried requests
-- 30 players betting at the same moment against the reserve limit
+- a full shared round from betting to pop, with two players seeing each other
+- bets after lift-off refused
+- cash-outs, auto cash-outs and pops
+- one bet per player per round, and retried requests
+- 30 players betting 1,000 at the same moment, cashed out together at the shared round limit
+- four engines ticking at once opening exactly one round
 - withdrawals that would touch promised money
-- seed reveal and re-verification
+- seeds hashing back to the published commitment
 - refresh-token reuse
-- reconciliation after every money test
+- reconciliation after the money tests
 
-## How a flight works
+## How a round works
 
-1. **Bet.** `POST /api/v1/game/flights` with `betMinor` (and optional `autoCashoutX100`) and an `Idempotency-Key`.
-   In one database transaction the server:
-   - checks the reserve limits
-   - takes the bet from the wallet
-   - computes the pop point from the player's seeds
-   - fixes the flight's cap and the moment it settles
-2. **Fly.** The multiplier is `floor(100 · e^(0.12 · seconds))` on the **database clock**: 2× after about 5.8 s, 10× after about 19 s.
-   The pop point stays secret until the flight is over.
-3. **Cash out.** `POST /flights/:id/cash-out` pays bet × the multiplier at the moment the server handles the request,
-   if the balloon has not popped. Cash-out opens at 1.01×.
-4. **Automatic settlement.** A background job (every 500 ms) settles flights without waiting for the player:
-   - auto cash-outs
-   - flights that reach their cap (the reserve limit)
-   - pops
+Everyone plays the same rounds and sees the same balloon:
 
-   A player who closes the page is still paid.
+1. **Betting (7 s by default, `GAME_BETTING_MS`).** Players place one bet each with `POST /api/v1/game/bets`, with
+   `betMinor` (and optional `autoCashoutX100`) and an `Idempotency-Key`. The bet is taken from the wallet at once.
+2. **Lift-off.** Betting closes on the **database clock**. The multiplier is `floor(100 · e^(0.12 · seconds))` from
+   lift-off: 2× after about 5.8 s, 10× after about 19 s.
+3. **Cash out.** `POST /game/bets/:id/cash-out` pays bet × the multiplier at the moment the server handles the
+   request, if the balloon hasn't popped. Cash-out opens at 1.01×.
+4. **Pop.** Bets still flying are lost. The round's seed is revealed and the next round opens.
+
+The **round engine** runs every 100 ms (`GAME_TICK_MS`):
+- it pays auto cash-outs and limit cash-outs at their exact multiplier, so a player who closes the page is still paid
+- it ends rounds and opens the next one
+- several servers can run it at once: a database lock picks one to move rounds forward, and each bet is settled
+  under its own row lock
+
+**What players see:** `GET /game/live`, which the site checks about 3 times a second, returns:
+- the current round
+- every bet in it, with phone numbers masked like `+2519******67`
+- who has cashed out at what
+- the last 24 pop points
+- the player's own bet
+
+The pop point of a round is never sent before it ends.
 
 Every money movement is a balanced journal in a double-entry ledger in integer minor units. The database rejects
 unbalanced journals, edits to ledger lines, a negative wallet and a negative reserve.
@@ -94,36 +103,41 @@ The **reserve** is the house bankroll that pays winners. Staff fund it and take 
 | Rule | Default | Setting |
 | --- | --- | --- |
 | The most one bet can cost the house (payout − bet), as a share of the reserve | 1% | `GAME_FLIGHT_RISK_BPS=100` |
-| The most all open flights together can cost the house, as a share of the reserve | 10% | `GAME_TOTAL_RISK_BPS=1000` |
+| The most one whole round can cost the house, as a share of the reserve | 10% | `GAME_TOTAL_RISK_BPS=1000` |
 | Highest multiplier anyone is paid at | 1000× | `GAME_MAX_MULTIPLIER_X100=100000` |
 | House edge | 3% | `GAME_EDGE_BPS=300` |
 
 How the limits are applied:
-- **What the limits are a share of:** the reserve minus the bets of flights still in the air. Those bets may soon be
-  paid back out, so they don't count. This amount doesn't change while people place bets, so every player gets the
-  same limit until the 10% for all open flights is used up. With a 100,000 reserve, ten 1,000 bets can fly at once.
-- **Free reserve:** the reserve minus everything open flights could still win. A new bet can never be promised more
-  than this, and it's the most a withdrawal can take.
-- **Bet limit:** a bet larger than the current limit is refused (`BET_ABOVE_LIMIT`, with the current maximum).
-- **Cap:** every accepted bet gets a cap, the multiplier where its winnings reach the limit. The flight is paid out
-  there automatically, so no payout can exceed what was set aside for it.
-- **Serialization:** new bets and reserve withdrawals take the same lock, so two bets can't both use the same free
-  money. A withdrawal can never take money promised to open flights.
-
-Taken together, the reserve always covers every open flight at its maximum, and one round can cost it at most 1%.
+- **What the limits are a share of:** the reserve minus the bets still in the air, which may soon be paid back out.
+- **Personal limit:** each bet gets its own cap, the multiplier where its winnings reach 1%. Bets larger than 1% are
+  refused (`BET_ABOVE_LIMIT`, with the current maximum).
+- **Shared round limit:** when a round's possible winnings would pass 10%, the round gets a limit and **everyone
+  still flying is cashed out together** there. Players see it on screen. For example, with a 100,000 reserve and 30
+  players betting 1,000, everyone is cashed out at 1.33× at the latest. A bet is refused only when even 1.01×
+  wouldn't fit (`ROUND_FULL`).
+- **Coverage:** a bet is refused if the reserve couldn't cover every open bet's largest payout after taking it. A
+  withdrawal can never take money promised to open bets.
 
 ## Provably fair
 
 ```
-h     = first 13 hex digits of HMAC-SHA256(key = serverSeed, message = clientSeed + ":" + nonce)
+seed[L] = random;  seed[i − 1] = SHA-256(seed[i]);  commitment = seed[0]   (published before round 1)
+round i uses seed[i] and reveals it when it ends
+
+h     = first 13 hex digits of HMAC-SHA256(key = seed, message = salt)
 E     = 2^52
 crash = floor((10000 − edgeBps) · E / (100 · (E − h))), at least 100   (×100: 250 = 2.50×)
 ```
 
-- **Before betting:** players see the SHA-256 hash of their server seed. The nonce goes up by one with each flight.
-- **After changing seeds:** **Change seeds** reveals the old server seed, and the Fairness page recomputes any flight
-  in the browser.
+- **Checking a round:** hash its seed with SHA-256. The result must be the seed of the round before it (the
+  commitment, for the first round).
+- **Why seeds can't be changed:** SHA-256 can't be reversed, so every seed was fixed when the commitment was published.
+- **In the browser:** the Fairness page shows the commitments and lets anyone check any round.
 - **Odds:** a target *m* is reached with probability (1 − edge) / *m*, so every strategy returns 97% over time.
+- **Chains:** each holds 100,000 rounds (`GAME_CHAIN_LENGTH`). When one runs out, a new chain with a new commitment
+  starts.
+- **Strongest guarantee:** publish the commitment somewhere public first (for example a social media post). Then set
+  `GAME_CHAIN_SALT` to a value nobody could know in advance, such as a later lottery draw.
 
 The formula is in `server/src/game/fairness.ts`.
 
@@ -166,4 +180,6 @@ The container applies pending migrations at start.
 - **Responsible-gambling tools:** deposit and loss limits, self-exclusion, cool-off periods, age and identity checks.
   These are likely license conditions.
 - **Amharic translation** of the site.
-- **Shared rounds**, where all players watch the same balloon. Each player currently flies their own.
+- **Live updates over WebSocket.** The site checks the server about 3 times a second, which is fine for hundreds of
+  players. Thousands at once would call for a WebSocket push instead.
+- **Betting on the next round** while one is flying. Today players wait for the betting window.

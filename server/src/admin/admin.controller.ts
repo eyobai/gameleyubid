@@ -1,5 +1,5 @@
 import { Body, Controller, Get, HttpStatus, Inject, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
-import { AccountStatus, AccountType, FlightStatus, JournalType, Prisma, Role } from '@prisma/client';
+import { AccountStatus, AccountType, BetStatus, JournalType, Prisma, Role, RoundStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
 import { CurrentUser, IdempotencyKey, Roles } from '../common/auth';
@@ -24,10 +24,10 @@ class ReserveMoveDto {
   reason: string;
 }
 
-class FlightsQuery {
+class BetsQuery {
   @IsOptional()
-  @IsIn(Object.values(FlightStatus))
-  status?: FlightStatus;
+  @IsIn(Object.values(BetStatus))
+  status?: BetStatus;
 
   @IsOptional()
   @IsUUID()
@@ -74,7 +74,7 @@ export class AdminController {
       async (tx) => {
         const state = await this.game.reserveState(tx);
         const g = this.config.game;
-        const limits = currentLimits(state, {
+        const limits = currentLimits({ ...state, openRiskMinor: 0n }, {
           flightRiskBps: g.flightRiskBps,
           totalRiskBps: g.totalRiskBps,
           maxMultiplierX100: g.maxMultiplierX100,
@@ -85,16 +85,19 @@ export class AdminController {
         const results: Record<string, unknown> = {};
         for (const [name, span] of Object.entries(periods)) {
           const since = span === null ? Prisma.sql`'-infinity'::timestamptz` : Prisma.sql`now() - ${span}::interval`;
-          const [r] = await tx.$queryRaw<{ flights: bigint; wins: bigint; bets: bigint; payouts: bigint; players: bigint }[]>`
+          const [r] = await tx.$queryRaw<{ flights: bigint; rounds: bigint; wins: bigint; bets: bigint; payouts: bigint; players: bigint }[]>`
             SELECT COUNT(*)::bigint AS flights,
+                   COUNT(DISTINCT round_id)::bigint AS rounds,
                    COUNT(*) FILTER (WHERE status = 'CASHED_OUT')::bigint AS wins,
                    COALESCE(SUM(bet_minor), 0)::bigint AS bets,
                    COALESCE(SUM(payout_minor), 0)::bigint AS payouts,
                    COUNT(DISTINCT user_id)::bigint AS players
-            FROM flights WHERE status <> 'OPEN' AND settled_at >= ${since}`;
+            FROM bets WHERE status <> 'OPEN' AND settled_at >= ${since}`;
           const revenue = r.bets - r.payouts;
           results[name] = {
+            /** Bets settled in the period. */
             flights: Number(r.flights),
+            rounds: Number(r.rounds),
             players: Number(r.players),
             playerWinRate: r.flights ? Number(r.wins) / Number(r.flights) : null,
             betsMinor: r.bets.toString(),
@@ -107,7 +110,8 @@ export class AdminController {
             holdRate: r.bets ? Number(revenue) / Number(r.bets) : null,
           };
         }
-        const openCount = await tx.flight.count({ where: { status: FlightStatus.OPEN } });
+        const openCount = await tx.bet.count({ where: { status: BetStatus.OPEN } });
+        const current = await tx.round.findFirst({ where: { status: { not: RoundStatus.ENDED } }, include: { _count: { select: { bets: true } } } });
         return {
           currency: this.config.currency.code,
           settings: {
@@ -118,6 +122,12 @@ export class AdminController {
             maxMultiplierX100: g.maxMultiplierX100,
             minBetMinor: g.minBetMinor.toString(),
             maxBetMinor: g.maxBetMinor.toString(),
+          },
+          currentRound: current && {
+            number: current.number,
+            status: current.status,
+            players: current._count.bets,
+            capX100: current.capX100,
           },
           reserve: {
             balanceMinor: state.reserveMinor.toString(),
@@ -184,16 +194,15 @@ export class AdminController {
     }, MONEY_TX);
   }
 
-  @Get('flights')
-  async flights(@Query() q: FlightsQuery) {
-    const rows = await this.prisma.flight.findMany({
+  @Get('bets')
+  async bets(@Query() q: BetsQuery) {
+    const rows = await this.prisma.bet.findMany({
       where: { status: q.status, userId: q.userId },
-      include: { seedPair: true, user: { select: { phoneNumber: true } } },
-      orderBy: { startedAt: 'desc' },
+      include: { round: true, user: { select: { phoneNumber: true } } },
+      orderBy: { createdAt: 'desc' },
       take: q.limit ?? 50,
     });
-    const now = new Date();
-    return { items: rows.map((f) => ({ ...this.game.toDto(f, now), userId: f.userId, phoneNumber: f.user.phoneNumber })) };
+    return { items: rows.map((b) => ({ ...this.game.toDto(b), userId: b.userId, phoneNumber: b.user.phoneNumber })) };
   }
 
   @Get('deposits')
@@ -237,14 +246,14 @@ export class AdminController {
         const [trial] = await tx.$queryRaw<{ total: bigint }[]>`
           SELECT COALESCE(SUM(CASE WHEN type = 'PAYMENT_CLEARING' THEN -balance_minor ELSE balance_minor END), 0)::bigint AS total FROM ledger_accounts`;
         const [flights] = await tx.$queryRaw<{ bad: bigint }[]>`
-          SELECT COUNT(*)::bigint AS bad FROM flights f
-          LEFT JOIN journals p ON p.id = f.payout_journal_id
-          WHERE f.status = 'CASHED_OUT' AND (p.amount_minor IS DISTINCT FROM f.payout_minor)`;
+          SELECT COUNT(*)::bigint AS bad FROM bets b
+          LEFT JOIN journals p ON p.id = b.payout_journal_id
+          WHERE b.status = 'CASHED_OUT' AND (p.amount_minor IS DISTINCT FROM b.payout_minor)`;
         return {
           ok: mismatches.length === 0 && trial.total === 0n && flights.bad === 0n,
           accountMismatches: mismatches.map((m) => ({ code: m.code, cachedMinor: m.cached.toString(), computedMinor: m.computed.toString() })),
           trialBalanceMinor: trial.total.toString(),
-          flightsWithWrongPayout: Number(flights.bad),
+          betsWithWrongPayout: Number(flights.bad),
         };
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },

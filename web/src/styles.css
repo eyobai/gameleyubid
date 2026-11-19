@@ -89,6 +89,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mult { font: 800 clamp(44px, 9vw, 92px) / 1 var(--display); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; text-shadow: 0 4px 30px rgba(10, 12, 40, 0.6); }
 .mult.win { color: var(--win); }
 .mult.bust { color: var(--bust); }
+.mult.wait { color: var(--muted); }
 .sub { margin-top: 8px; font-size: 14px; color: var(--muted); min-height: 1.5em; }
 .sub b { color: var(--fg); font-family: var(--mono); }
 

@@ -16,16 +16,16 @@ import {
   Res,
 } from '@nestjs/common';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
 import type { Response } from 'express';
 import { CurrentUser, IdempotencyKey, Public } from '../common/auth';
 import type { AuthUser } from '../common/auth';
 import { APP_CONFIG } from '../config/config';
 import type { AppConfig } from '../config/config';
-import { CLIENT_SEED_PATTERN, crashPointX100, hashSeed } from './fairness';
+import { roundCrashX100, sha256 } from './fairness';
 import { GameService } from './game.service';
 
-class StartFlightDto {
+class PlaceBetDto {
   /** Integer minor units as text, e.g. "5000" for 50.00. */
   @IsString()
   @Matches(/^[1-9]\d{0,14}$/)
@@ -37,39 +37,29 @@ class StartFlightDto {
   autoCashoutX100?: number;
 }
 
-class RotateSeedsDto {
-  @IsOptional()
-  @IsString()
-  @Matches(CLIENT_SEED_PATTERN)
-  clientSeed?: string;
-}
-
-class ListQuery {
+class LimitQuery {
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(100)
+  @Max(200)
   limit?: number;
 
   @IsOptional()
-  @IsString()
-  before?: string;
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  before?: number;
 }
 
 class VerifyQuery {
   @IsString()
   @Matches(/^[0-9a-f]{64}$/)
-  serverSeed: string;
+  seed: string;
 
   @IsString()
-  @Matches(CLIENT_SEED_PATTERN)
-  clientSeed: string;
-
-  @Type(() => Number)
-  @IsInt()
-  @Min(0)
-  nonce: number;
+  @Length(1, 100)
+  salt: string;
 
   @Type(() => Number)
   @IsInt()
@@ -88,58 +78,61 @@ export class GameController {
     return this.game.info();
   }
 
-  /** Recomputes a pop point from revealed seeds. The same formula is published so anyone can check it themselves. */
-  @Public()
-  @Get('verify')
-  verify(@Query() q: VerifyQuery) {
-    const crash = crashPointX100(q.serverSeed, q.clientSeed, q.nonce, q.edgeBps);
-    return { serverSeedHash: hashSeed(q.serverSeed), crashX100: crash.toString() };
+  /** The round in progress, everyone's bets in it, recent pop points and my own bet. Poll a few times a second. */
+  @Get('live')
+  live(@CurrentUser() user: AuthUser) {
+    return this.game.live(user.id);
   }
 
-  @Get('seeds')
-  seeds(@CurrentUser() user: AuthUser) {
-    return this.game.seeds(user.id);
-  }
-
-  @HttpCode(HttpStatus.OK)
-  @Post('seeds/rotate')
-  rotate(@CurrentUser() user: AuthUser, @Body() dto: RotateSeedsDto) {
-    return this.game.rotateSeeds(user.id, dto.clientSeed);
-  }
-
-  @Post('flights')
-  async start(
-    @CurrentUser() user: AuthUser,
-    @Body() dto: StartFlightDto,
-    @IdempotencyKey() key: string,
-    @Res({ passthrough: true }) res: Response,
-  ) {
-    const { flight, replayed } = await this.game.start(user, BigInt(dto.betMinor), dto.autoCashoutX100 ?? null, key);
+  @Post('bets')
+  async place(@CurrentUser() user: AuthUser, @Body() dto: PlaceBetDto, @IdempotencyKey() key: string, @Res({ passthrough: true }) res: Response) {
+    const { bet, replayed } = await this.game.placeBet(user, BigInt(dto.betMinor), dto.autoCashoutX100 ?? null, key);
     if (replayed) res.setHeader('Idempotent-Replayed', 'true');
-    return flight;
+    return bet;
   }
 
-  @Get('flights')
-  list(@CurrentUser() user: AuthUser, @Query() q: ListQuery) {
-    return this.game.listMine(user.id, q.limit, q.before);
+  @Get('bets')
+  mine(@CurrentUser() user: AuthUser, @Query() q: LimitQuery) {
+    return this.game.listMine(user.id, q.limit);
   }
 
-  @Get('flights/:id')
+  @Get('bets/:id')
   get(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
-    return this.game.get(user, id);
+    return this.game.getBet(user, id);
   }
 
   @HttpCode(HttpStatus.OK)
-  @Post('flights/:id/cash-out')
+  @Post('bets/:id/cash-out')
   cashOut(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
     return this.game.cashOut(user, id);
   }
+
+  /** Ended rounds with their seeds. */
+  @Public()
+  @Get('rounds')
+  rounds(@Query() q: LimitQuery) {
+    return this.game.rounds(q.limit, q.before);
+  }
+
+  /** Published commitments of every seed chain. */
+  @Public()
+  @Get('chains')
+  chains() {
+    return this.game.chains();
+  }
+
+  /** Recomputes a round from its seed. The same formula is published so anyone can check it themselves. */
+  @Public()
+  @Get('verify')
+  verify(@Query() q: VerifyQuery) {
+    return { previousSeed: sha256(q.seed), crashX100: roundCrashX100(q.seed, q.salt, q.edgeBps).toString() };
+  }
 }
 
-/** Settles flights that reached their auto cash-out, their limit or their pop while nobody was asking. */
+/** Runs the round engine on a timer. */
 @Injectable()
-export class SettlementWorker implements OnApplicationBootstrap, OnApplicationShutdown {
-  private readonly logger = new Logger('Settlement');
+export class RoundEngine implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('RoundEngine');
   private timer?: NodeJS.Timeout;
   private running = false;
 
@@ -149,7 +142,7 @@ export class SettlementWorker implements OnApplicationBootstrap, OnApplicationSh
   ) {}
 
   onApplicationBootstrap() {
-    const every = this.config.game.settleIntervalMs;
+    const every = this.config.game.tickMs;
     if (every <= 0) return;
     this.timer = setInterval(() => void this.tick(), every);
     this.timer.unref();
@@ -163,7 +156,7 @@ export class SettlementWorker implements OnApplicationBootstrap, OnApplicationSh
     if (this.running) return;
     this.running = true;
     try {
-      await this.game.settleDue();
+      await this.game.tick();
     } catch (e) {
       this.logger.error(e instanceof Error ? e.message : String(e));
     } finally {

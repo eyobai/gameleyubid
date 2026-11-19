@@ -32,8 +32,7 @@ model User {
 
   refreshTokens RefreshToken[]
   account       LedgerAccount?
-  seedPairs     SeedPair[]
-  flights       Flight[]
+  bets          Bet[]
   deposits      Deposit[]
 
   @@map("users")
@@ -134,62 +133,87 @@ model GameState {
   @@map("game_state")
 }
 
-/// Provably fair seeds. The hash is shown before any bet; the seed itself only after the pair is retired.
-model SeedPair {
-  id             String    @id @default(uuid()) @db.Uuid
-  userId         String    @map("user_id") @db.Uuid
-  serverSeed     String    @map("server_seed") @db.Char(64)
-  serverSeedHash String    @map("server_seed_hash") @db.Char(64)
-  clientSeed     String    @map("client_seed") @db.VarChar(64)
-  nextNonce      Int       @default(0) @map("next_nonce")
-  active         Boolean   @default(true)
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  revealedAt     DateTime? @map("revealed_at") @db.Timestamptz(3)
+/// A hash chain of round seeds. `commitment` is published before the first round that uses the chain; each round
+/// reveals its seed, and SHA-256 of a round's seed is the seed of the round before it (the commitment for the first).
+model SeedChain {
+  id         String   @id @default(uuid()) @db.Uuid
+  commitment String   @unique @db.Char(64)
+  topSeed    String   @map("top_seed") @db.Char(64) // secret: the last seed of the chain
+  length     Int
+  salt       String   @db.VarChar(100)
+  nextIndex  Int      @default(1) @map("next_index")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
-  user    User     @relation(fields: [userId], references: [id])
-  flights Flight[]
+  rounds Round[]
 
-  @@index([userId, createdAt])
-  @@map("seed_pairs")
+  @@map("seed_chains")
 }
 
-enum FlightStatus {
+enum RoundStatus {
+  BETTING
+  FLYING
+  ENDED
+}
+
+/// One shared flight. Its pop point is fixed when it is created; its seed is shown only once it has ended.
+model Round {
+  id         String      @id @default(uuid()) @db.Uuid
+  number     Int         @unique
+  chainId    String      @map("chain_id") @db.Uuid
+  chainIndex Int         @map("chain_index")
+  seed       String      @db.Char(64)
+  edgeBps    Int         @map("edge_bps")
+  crashX100  BigInt      @map("crash_x100")
+  status     RoundStatus @default(BETTING)
+  /// Shared reserve limit for this round: everyone still flying is cashed out here. Null while no bet needs one.
+  capX100    Int?        @map("cap_x100")
+  createdAt  DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  startsAt   DateTime    @map("starts_at") @db.Timestamptz(3) // betting closes, the balloon lifts off
+  endedAt    DateTime?   @map("ended_at") @db.Timestamptz(3)
+
+  chain SeedChain @relation(fields: [chainId], references: [id])
+  bets  Bet[]
+
+  @@unique([chainId, chainIndex])
+  @@index([status])
+  @@map("rounds")
+}
+
+enum BetStatus {
   OPEN
   CASHED_OUT
   BUSTED
 }
 
-/// One bet. Everything that decides it is fixed when it starts: the pop point, the cap and the moment it settles.
-model Flight {
-  id               String       @id @default(uuid()) @db.Uuid
-  userId           String       @map("user_id") @db.Uuid
-  idempotencyKey   String       @map("idempotency_key") @db.VarChar(100)
-  seedPairId       String       @map("seed_pair_id") @db.Uuid
-  nonce            Int
-  edgeBps          Int          @map("edge_bps")
-  betMinor         BigInt       @map("bet_minor")
-  autoCashoutX100  Int?         @map("auto_cashout_x100")
-  capX100          Int          @map("cap_x100") // the reserve's limit for this bet: paid out here at the latest
-  maxPayoutMinor   BigInt       @map("max_payout_minor")
-  crashX100        BigInt       @map("crash_x100") // secret until the flight settles
-  status           FlightStatus @default(OPEN)
-  startedAt        DateTime     @map("started_at") @db.Timestamptz(3)
-  settleAt         DateTime     @map("settle_at") @db.Timestamptz(3) // when the outcome is decided without the player
-  cashoutX100      Int?         @map("cashout_x100")
-  cashoutReason    String?      @map("cashout_reason") @db.VarChar(20) // PLAYER, AUTO, LIMIT
-  payoutMinor      BigInt?      @map("payout_minor")
-  settledAt        DateTime?    @map("settled_at") @db.Timestamptz(3)
-  betJournalId     String       @unique @map("bet_journal_id") @db.Uuid
-  payoutJournalId  String?      @unique @map("payout_journal_id") @db.Uuid
+/// One player's bet in one round.
+model Bet {
+  id               String    @id @default(uuid()) @db.Uuid
+  roundId          String    @map("round_id") @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  idempotencyKey   String    @map("idempotency_key") @db.VarChar(100)
+  betMinor         BigInt    @map("bet_minor")
+  autoCashoutX100  Int?      @map("auto_cashout_x100")
+  personalCapX100  Int       @map("personal_cap_x100") // this bet's own reserve limit
+  capX100          Int       @map("cap_x100") // the lower of the personal and the round limit
+  maxPayoutMinor   BigInt    @map("max_payout_minor")
+  status           BetStatus @default(OPEN)
+  settleAt         DateTime? @map("settle_at") @db.Timestamptz(3) // set at lift-off: when it is decided without the player
+  cashoutX100      Int?      @map("cashout_x100")
+  cashoutReason    String?   @map("cashout_reason") @db.VarChar(20) // PLAYER, AUTO, LIMIT
+  payoutMinor      BigInt?   @map("payout_minor")
+  settledAt        DateTime? @map("settled_at") @db.Timestamptz(3)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  betJournalId     String    @unique @map("bet_journal_id") @db.Uuid
+  payoutJournalId  String?   @unique @map("payout_journal_id") @db.Uuid
 
-  user     User     @relation(fields: [userId], references: [id])
-  seedPair SeedPair @relation(fields: [seedPairId], references: [id])
+  round Round @relation(fields: [roundId], references: [id])
+  user  User  @relation(fields: [userId], references: [id])
 
+  @@unique([roundId, userId])
   @@unique([userId, idempotencyKey])
-  @@unique([seedPairId, nonce])
-  @@index([userId, startedAt])
+  @@index([userId, createdAt])
   @@index([status, settleAt])
-  @@map("flights")
+  @@map("bets")
 }
 
 enum DepositStatus {

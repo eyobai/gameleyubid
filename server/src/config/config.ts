@@ -23,7 +23,12 @@ export interface AppConfig {
     maxMultiplierX100: number;
     minBetMinor: bigint;
     maxBetMinor: bigint;
-    settleIntervalMs: number;
+    /** How long betting stays open before each round lifts off. */
+    bettingMs: number;
+    /** How often the round engine runs (settles cash-outs, ends and starts rounds). 0 = never (tests drive it). */
+    tickMs: number;
+    chainLength: number;
+    chainSalt: string;
   };
   payments: {
     provider: 'none' | 'chapa';
@@ -64,7 +69,10 @@ const schema = Joi.object({
   GAME_MAX_MULTIPLIER_X100: Joi.number().integer().min(200).max(1_000_000).default(100_000),
   GAME_MIN_BET_MINOR: Joi.number().integer().min(1).default(100),
   GAME_MAX_BET_MINOR: Joi.number().integer().min(1).default(1_000_000),
-  GAME_SETTLE_INTERVAL_MS: Joi.number().integer().min(0).default(500),
+  GAME_BETTING_MS: Joi.number().integer().min(2000).max(60000).default(7000),
+  GAME_TICK_MS: Joi.number().integer().min(0).max(1000).default(100),
+  GAME_CHAIN_LENGTH: Joi.number().integer().min(10).max(1_000_000).default(100_000),
+  GAME_CHAIN_SALT: Joi.string().min(1).max(100).default('updraft'),
 
   PAYMENT_PROVIDER: Joi.string().valid('none', 'chapa').default('none'),
   CHAPA_SECRET_KEY: Joi.string().allow('').default(''),
@@ -123,7 +131,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxMultiplierX100: v.GAME_MAX_MULTIPLIER_X100,
       minBetMinor: BigInt(v.GAME_MIN_BET_MINOR),
       maxBetMinor: BigInt(v.GAME_MAX_BET_MINOR),
-      settleIntervalMs: v.GAME_SETTLE_INTERVAL_MS,
+      bettingMs: v.GAME_BETTING_MS,
+      tickMs: v.GAME_TICK_MS,
+      chainLength: v.GAME_CHAIN_LENGTH,
+      chainSalt: v.GAME_CHAIN_SALT,
     },
     payments: {
       provider: v.PAYMENT_PROVIDER,

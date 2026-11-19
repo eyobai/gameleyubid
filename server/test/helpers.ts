@@ -44,7 +44,8 @@ export async function createApp(env: Record<string, string> = {}): Promise<TestA
     DATABASE_URL: TEST_DB,
     JWT_ACCESS_SECRET: 'test-access-secret-that-is-long-enough-1234',
     GAME_ENABLED: 'true',
-    GAME_SETTLE_INTERVAL_MS: '0',
+    GAME_TICK_MS: '0',
+    GAME_CHAIN_LENGTH: '1000',
     THROTTLE_LIMIT: '100000',
     AUTH_THROTTLE_LIMIT: '100000',
     ...env,
@@ -69,7 +70,7 @@ export async function createApp(env: Record<string, string> = {}): Promise<TestA
 export async function resetDb(prisma: PrismaService): Promise<void> {
   // Append-only triggers would refuse DELETE; TRUNCATE does not fire them.
   await prisma.$executeRawUnsafe(
-    'TRUNCATE audit_logs, provider_events, deposits, flights, seed_pairs, ledger_entries, journals, ledger_accounts, refresh_tokens, users CASCADE',
+    'TRUNCATE audit_logs, provider_events, deposits, bets, rounds, seed_chains, ledger_entries, journals, ledger_accounts, refresh_tokens, users CASCADE',
   );
 }
 
@@ -110,12 +111,6 @@ export async function fundReserve(t: TestApp, financeToken: string, amountMinor:
 
 export const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
 export const key = () => `k-${randomUUID()}`;
-
-/** Moves a flight's clock back so it looks `ms` older, without waiting in real time. */
-export async function age(t: TestApp, flightId: string, ms: number): Promise<void> {
-  await t.prisma.$executeRaw`UPDATE flights SET started_at = started_at - make_interval(secs => ${ms / 1000}),
-    settle_at = settle_at - make_interval(secs => ${ms / 1000}) WHERE id = ${flightId}::uuid`;
-}
 
 export async function balance(t: TestApp, token: string): Promise<bigint> {
   const res = await t.http().get('/api/v1/wallet').set(auth(token)).expect(200);

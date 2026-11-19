@@ -1,16 +1,17 @@
 import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { fromMinor, toMinor } from '../lib/money';
-import { crashPointX100, multiplierAt } from './math';
+import { multiplierAt, roundCrashX100 } from './math';
 
 describe('browser fairness check', () => {
   it('matches the server formula', async () => {
     const seed = 'ab'.repeat(32);
-    for (let nonce = 0; nonce < 50; nonce++) {
-      const h = BigInt('0x' + createHmac('sha256', seed).update(`c:${nonce}`).digest('hex').slice(0, 13));
+    for (let i = 0; i < 50; i++) {
+      const salt = `salt-${i}`;
+      const h = BigInt('0x' + createHmac('sha256', seed).update(salt).digest('hex').slice(0, 13));
       const e = 2n ** 52n;
       const c = (9700n * e) / (100n * (e - h));
-      expect(await crashPointX100(seed, 'c', nonce, 300)).toBe(c < 100n ? 100n : c);
+      expect(await roundCrashX100(seed, salt, 300)).toBe(c < 100n ? 100n : c);
     }
   });
   it('grows like the server', () => {
