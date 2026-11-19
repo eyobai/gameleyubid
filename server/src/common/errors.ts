@@ -1,0 +1,49 @@
+import { HttpException, HttpStatus } from '@nestjs/common';
+
+/** Stable machine-readable codes in the `error` field of every error response. */
+export enum ErrorCode {
+  VALIDATION_FAILED = 'VALIDATION_FAILED',
+  UNAUTHORIZED = 'UNAUTHORIZED',
+  FORBIDDEN = 'FORBIDDEN',
+  NOT_FOUND = 'NOT_FOUND',
+  RATE_LIMITED = 'RATE_LIMITED',
+  SERVICE_BUSY = 'SERVICE_BUSY',
+  INTERNAL_ERROR = 'INTERNAL_ERROR',
+
+  INVALID_PHONE_NUMBER = 'INVALID_PHONE_NUMBER',
+  PHONE_ALREADY_REGISTERED = 'PHONE_ALREADY_REGISTERED',
+  INVALID_CREDENTIALS = 'INVALID_CREDENTIALS',
+  ACCOUNT_BLOCKED = 'ACCOUNT_BLOCKED',
+  INVALID_REFRESH_TOKEN = 'INVALID_REFRESH_TOKEN',
+
+  INSUFFICIENT_FUNDS = 'INSUFFICIENT_FUNDS',
+  IDEMPOTENCY_KEY_REQUIRED = 'IDEMPOTENCY_KEY_REQUIRED',
+  IDEMPOTENCY_KEY_REUSED = 'IDEMPOTENCY_KEY_REUSED',
+
+  GAME_DISABLED = 'GAME_DISABLED',
+  BET_TOO_SMALL = 'BET_TOO_SMALL',
+  BET_ABOVE_LIMIT = 'BET_ABOVE_LIMIT',
+  FLIGHT_IN_PROGRESS = 'FLIGHT_IN_PROGRESS',
+  FLIGHT_SETTLED = 'FLIGHT_SETTLED',
+  CASHOUT_TOO_EARLY = 'CASHOUT_TOO_EARLY',
+  RESERVE_TOO_LOW = 'RESERVE_TOO_LOW',
+
+  PAYMENTS_UNAVAILABLE = 'PAYMENTS_UNAVAILABLE',
+  PAYMENT_PROVIDER_ERROR = 'PAYMENT_PROVIDER_ERROR',
+  DEPOSIT_AMOUNT_INVALID = 'DEPOSIT_AMOUNT_INVALID',
+  DEPOSIT_LIMIT_REACHED = 'DEPOSIT_LIMIT_REACHED',
+  WEBHOOK_SIGNATURE_INVALID = 'WEBHOOK_SIGNATURE_INVALID',
+}
+
+export class AppException extends HttpException {
+  constructor(
+    status: HttpStatus,
+    public readonly code: ErrorCode,
+    message: string,
+    public readonly details?: Record<string, unknown>,
+  ) {
+    super({ error: code, message, details }, status);
+  }
+}
+
+export const notFound = (what = 'Not found') => new AppException(HttpStatus.NOT_FOUND, ErrorCode.NOT_FOUND, what);

@@ -1,0 +1,246 @@
+// Updraft: a standalone cash-out game. One currency (configured), money in integer minor units.
+// Rules the database enforces on top of this file are in migrations/*/migration.sql (checks, triggers, partial indexes).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PLAYER
+  FINANCE // funds and withdraws the reserve, reads money reports
+  ADMIN // reads everything, manages players
+}
+
+enum AccountStatus {
+  ACTIVE
+  BLOCKED
+}
+
+model User {
+  id           String        @id @default(uuid()) @db.Uuid
+  phoneNumber  String        @unique @map("phone_number") @db.VarChar(20) // E.164
+  passwordHash String        @map("password_hash")
+  role         Role          @default(PLAYER)
+  status       AccountStatus @default(ACTIVE)
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  refreshTokens RefreshToken[]
+  account       LedgerAccount?
+  seedPairs     SeedPair[]
+  flights       Flight[]
+  deposits      Deposit[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  familyId  String    @map("family_id") @db.Uuid // one sign-in; every rotation stays in the family
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+  rotatedAt DateTime? @map("rotated_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+enum AccountType {
+  PLAYER_WALLET // liability: money owed to one player
+  GAME_RESERVE // the house bankroll that pays winners; never negative
+  PAYMENT_CLEARING // asset: money received through the payment provider (debit-normal)
+  OWNER_FUNDS // the owners' money put into or taken out of the reserve (may go negative)
+}
+
+model LedgerAccount {
+  id            String      @id @default(uuid()) @db.Uuid
+  code          String      @unique @db.VarChar(80) // "GAME_RESERVE", "PLAYER_WALLET:<userId>"
+  type          AccountType
+  userId        String?     @unique @map("user_id") @db.Uuid
+  allowNegative Boolean     @default(false) @map("allow_negative")
+  balanceMinor  BigInt      @default(0) @map("balance_minor")
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user    User?          @relation(fields: [userId], references: [id])
+  entries LedgerEntry[]
+
+  @@map("ledger_accounts")
+}
+
+enum JournalType {
+  DEPOSIT
+  BET
+  PAYOUT
+  RESERVE_FUNDING
+  RESERVE_WITHDRAWAL
+}
+
+enum EntryDirection {
+  DEBIT
+  CREDIT
+}
+
+/// One money movement. Its entries balance (checked by a deferred trigger) and can never be changed.
+model Journal {
+  id             String      @id @default(uuid()) @db.Uuid
+  reference      String      @unique @db.VarChar(40)
+  type           JournalType
+  amountMinor    BigInt      @map("amount_minor")
+  idempotencyKey String?     @unique @map("idempotency_key") @db.VarChar(200)
+  description    String?     @db.VarChar(300)
+  metadata       Json?
+  createdById    String?     @map("created_by_id") @db.Uuid
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  entries LedgerEntry[]
+
+  @@index([type, createdAt])
+  @@map("journals")
+}
+
+model LedgerEntry {
+  id                String         @id @default(uuid()) @db.Uuid
+  sequence          BigInt         @default(autoincrement())
+  journalId         String         @map("journal_id") @db.Uuid
+  accountId         String         @map("account_id") @db.Uuid
+  direction         EntryDirection
+  amountMinor       BigInt         @map("amount_minor")
+  balanceAfterMinor BigInt         @map("balance_after_minor")
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  journal Journal       @relation(fields: [journalId], references: [id])
+  account LedgerAccount @relation(fields: [accountId], references: [id])
+
+  @@index([accountId, sequence])
+  @@index([journalId])
+  @@map("ledger_entries")
+}
+
+/// Serializes every change to the reserve's commitments (new flights, reserve withdrawals). Exactly one row, id = 1.
+model GameState {
+  id        Int      @id
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  @@map("game_state")
+}
+
+/// Provably fair seeds. The hash is shown before any bet; the seed itself only after the pair is retired.
+model SeedPair {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  serverSeed     String    @map("server_seed") @db.Char(64)
+  serverSeedHash String    @map("server_seed_hash") @db.Char(64)
+  clientSeed     String    @map("client_seed") @db.VarChar(64)
+  nextNonce      Int       @default(0) @map("next_nonce")
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  revealedAt     DateTime? @map("revealed_at") @db.Timestamptz(3)
+
+  user    User     @relation(fields: [userId], references: [id])
+  flights Flight[]
+
+  @@index([userId, createdAt])
+  @@map("seed_pairs")
+}
+
+enum FlightStatus {
+  OPEN
+  CASHED_OUT
+  BUSTED
+}
+
+/// One bet. Everything that decides it is fixed when it starts: the pop point, the cap and the moment it settles.
+model Flight {
+  id               String       @id @default(uuid()) @db.Uuid
+  userId           String       @map("user_id") @db.Uuid
+  idempotencyKey   String       @map("idempotency_key") @db.VarChar(100)
+  seedPairId       String       @map("seed_pair_id") @db.Uuid
+  nonce            Int
+  edgeBps          Int          @map("edge_bps")
+  betMinor         BigInt       @map("bet_minor")
+  autoCashoutX100  Int?         @map("auto_cashout_x100")
+  capX100          Int          @map("cap_x100") // the reserve's limit for this bet: paid out here at the latest
+  maxPayoutMinor   BigInt       @map("max_payout_minor")
+  crashX100        BigInt       @map("crash_x100") // secret until the flight settles
+  status           FlightStatus @default(OPEN)
+  startedAt        DateTime     @map("started_at") @db.Timestamptz(3)
+  settleAt         DateTime     @map("settle_at") @db.Timestamptz(3) // when the outcome is decided without the player
+  cashoutX100      Int?         @map("cashout_x100")
+  cashoutReason    String?      @map("cashout_reason") @db.VarChar(20) // PLAYER, AUTO, LIMIT
+  payoutMinor      BigInt?      @map("payout_minor")
+  settledAt        DateTime?    @map("settled_at") @db.Timestamptz(3)
+  betJournalId     String       @unique @map("bet_journal_id") @db.Uuid
+  payoutJournalId  String?      @unique @map("payout_journal_id") @db.Uuid
+
+  user     User     @relation(fields: [userId], references: [id])
+  seedPair SeedPair @relation(fields: [seedPairId], references: [id])
+
+  @@unique([userId, idempotencyKey])
+  @@unique([seedPairId, nonce])
+  @@index([userId, startedAt])
+  @@index([status, settleAt])
+  @@map("flights")
+}
+
+enum DepositStatus {
+  INITIATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  EXPIRED
+}
+
+model Deposit {
+  id                String        @id @default(uuid()) @db.Uuid
+  userId            String        @map("user_id") @db.Uuid
+  idempotencyKey    String        @map("idempotency_key") @db.VarChar(100)
+  reference         String        @unique @db.VarChar(40) // our tx_ref at Chapa
+  amountMinor       BigInt        @map("amount_minor")
+  status            DepositStatus @default(INITIATED)
+  testMode          Boolean       @map("test_mode")
+  checkoutUrl       String?       @map("checkout_url") @db.VarChar(500)
+  providerReference String?       @map("provider_reference") @db.VarChar(100)
+  journalId         String?       @unique @map("journal_id") @db.Uuid
+  failureReason     String?       @map("failure_reason") @db.VarChar(300)
+  reviewReason      String?       @map("review_reason") @db.VarChar(300) // set when Chapa reports something that does not match
+  lastCheckedAt     DateTime?     @map("last_checked_at") @db.Timestamptz(3)
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, idempotencyKey])
+  @@index([status, createdAt])
+  @@map("deposits")
+}
+
+model ProviderEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  eventKey  String   @unique @map("event_key") @db.Char(64) // SHA-256 of the raw body
+  payload   Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@map("provider_events")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @map("actor_id") @db.Uuid
+  action    String   @db.VarChar(80)
+  entity    String   @db.VarChar(80)
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([createdAt])
+  @@map("audit_logs")
+}
