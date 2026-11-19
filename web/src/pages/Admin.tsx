@@ -86,7 +86,7 @@ export function Admin() {
           <div className="stat"><span className="lbl">Max bet right now</span><b>{group(summary.reserve.maxBetNow)}</b></div>
         </div>
         <p className="hint" style={{ margin: 0 }}>
-          Edge {s.edgeBps / 100}% · one bet can cost at most {s.flightRiskBps / 100}% of the free reserve · all open flights at most{' '}
+          Edge {s.edgeBps / 100}% · one bet can cost at most {s.flightRiskBps / 100}% of the reserve · all open flights at most{' '}
           {s.totalRiskBps / 100}% of the reserve · highest multiplier {x(s.maxMultiplierX100)}. Withdrawals can never touch money promised to open flights.
         </p>
       </section>

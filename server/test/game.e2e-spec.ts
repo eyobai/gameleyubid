@@ -187,12 +187,16 @@ describe('the reserve', () => {
     await Promise.all(players.map((p) => credit(t, p.id, 100_000n)));
     const results = await Promise.all(players.map((p) => start(p.token, '10000')));
     const accepted = results.filter((r) => r.status === 201);
-    expect(accepted.length).toBeGreaterThan(0);
+    // 1% of 1,000,000 = 10,000 per flight, 10% = 100,000 for all: exactly ten maximum bets fit, at the same limit.
+    expect(accepted).toHaveLength(10);
+    expect(accepted.every((r) => r.body.capX100 === 200)).toBe(true);
+    const refused = results.filter((r) => r.status !== 201);
+    expect(refused.every((r) => r.body.error === 'BET_ABOVE_LIMIT')).toBe(true);
     const [row] = await t.prisma.$queryRaw<{ risk: bigint; committed: bigint }[]>`
       SELECT COALESCE(SUM(max_payout_minor - bet_minor),0)::bigint AS risk, COALESCE(SUM(max_payout_minor),0)::bigint AS committed FROM flights WHERE status = 'OPEN'`;
     const reserve = await t.prisma.ledgerAccount.findUniqueOrThrow({ where: { code: 'GAME_RESERVE' } });
     expect(row.committed).toBeLessThanOrEqual(reserve.balanceMinor);
-    expect(row.risk).toBeLessThanOrEqual(110_000n);
+    expect(row.risk).toBe(100_000n);
 
     // Every open flight wins its maximum: the reserve must still pay all of them.
     const open = await t.prisma.flight.findMany({ where: { status: 'OPEN' } });

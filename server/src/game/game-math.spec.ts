@@ -80,30 +80,57 @@ describe('reserve limits', () => {
     maxBetMinor: 10_000_000n,
   };
 
-  it('allows 1% of the free reserve per flight', () => {
-    const l = currentLimits({ reserveMinor: 10_000_000n, committedMinor: 0n, openRiskMinor: 0n }, s);
+  it('allows 1% of the reserve per flight', () => {
+    const l = currentLimits({ reserveMinor: 10_000_000n, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n }, s);
     expect(l.flightLimitMinor).toBe(100_000n);
     expect(l.maxBetMinor).toBe(100_000n);
   });
 
-  it('counts what open flights could still win', () => {
-    const l = currentLimits({ reserveMinor: 10_000_000n, committedMinor: 5_000_000n, openRiskMinor: 900_000n }, s);
-    // free = 5,000,000 → 1% = 50,000; total room = 1,000,000 - 900,000 = 100,000
-    expect(l.flightLimitMinor).toBe(50_000n);
-    const tight = currentLimits({ reserveMinor: 10_000_000n, committedMinor: 1_000_000n, openRiskMinor: 980_000n }, s);
-    expect(tight.flightLimitMinor).toBe(20_000n);
+  it('keeps the same per-flight limit while others fly, until the total is used up', () => {
+    // 100,000.00 reserve; three open 1,000 bets, each able to cost the house 1,000.
+    const three = { reserveMinor: 10_300_000n, openBetsMinor: 300_000n, committedMinor: 600_000n, openRiskMinor: 300_000n };
+    expect(currentLimits(three, s).flightLimitMinor).toBe(100_000n);
+    // Nine open: 10% of 100,000 = 10,000 total, 9,000 used → 1,000 left.
+    const nine = { reserveMinor: 10_900_000n, openBetsMinor: 900_000n, committedMinor: 1_800_000n, openRiskMinor: 900_000n };
+    expect(currentLimits(nine, s).flightLimitMinor).toBe(100_000n);
+    const ten = { reserveMinor: 11_000_000n, openBetsMinor: 1_000_000n, committedMinor: 2_000_000n, openRiskMinor: 1_000_000n };
+    expect(currentLimits(ten, s).flightLimitMinor).toBe(0n);
+  });
+
+  it('never promises more than the reserve holds', () => {
+    // A reserve almost fully owed to open flights allows only what is left over.
+    const owed = { reserveMinor: 1_000_000n, openBetsMinor: 0n, committedMinor: 995_000n, openRiskMinor: 0n };
+    expect(currentLimits(owed, s).flightLimitMinor).toBe(5_000n);
+  });
+
+  it('allows exactly ten maximum bets at once on a 100,000 reserve, all of them covered', () => {
+    const st = { reserveMinor: 10_000_000n, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n };
+    let accepted = 0;
+    for (let i = 0; i < 50; i++) {
+      const r = checkBet(100_000n, st, s);
+      if (!r.ok) continue;
+      accepted++;
+      st.reserveMinor += 100_000n;
+      st.openBetsMinor += 100_000n;
+      st.committedMinor += r.maxPayoutMinor;
+      st.openRiskMinor += r.maxPayoutMinor - 100_000n;
+      expect(r.capX100).toBe(200);
+    }
+    expect(accepted).toBe(10);
+    expect(st.reserveMinor).toBeGreaterThanOrEqual(st.committedMinor);
   });
 
   it('never allows anything when the reserve is empty or fully committed', () => {
-    expect(currentLimits({ reserveMinor: 0n, committedMinor: 0n, openRiskMinor: 0n }, s).maxBetMinor).toBe(0n);
-    expect(currentLimits({ reserveMinor: 100n, committedMinor: 200n, openRiskMinor: 0n }, s).maxBetMinor).toBe(0n);
+    expect(currentLimits({ reserveMinor: 0n, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n }, s).maxBetMinor).toBe(0n);
+    expect(currentLimits({ reserveMinor: 100n, openBetsMinor: 0n, committedMinor: 200n, openRiskMinor: 0n }, s).maxBetMinor).toBe(0n);
+    expect(currentLimits({ reserveMinor: 500n, openBetsMinor: 500n, committedMinor: 500n, openRiskMinor: 0n }, s).maxBetMinor).toBe(0n);
   });
 
   it('caps each bet so its house loss stays within the limit', () => {
     expect(capFor(5_000n, 100_000n, 100000)).toBe(2100);
     expect(capFor(1n, 100_000n, 100000)).toBe(100000);
     for (const bet of [100n, 777n, 5_000n, 99_999n, 100_000n]) {
-      const r = checkBet(bet, { reserveMinor: 10_000_000n, committedMinor: 0n, openRiskMinor: 0n }, s);
+      const r = checkBet(bet, { reserveMinor: 10_000_000n, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n }, s);
       expect(r.ok).toBe(true);
       if (r.ok) {
         expect(r.maxPayoutMinor - bet).toBeLessThanOrEqual(100_000n);
@@ -113,7 +140,7 @@ describe('reserve limits', () => {
   });
 
   it('refuses bets below the minimum or above the limit', () => {
-    const state = { reserveMinor: 10_000_000n, committedMinor: 0n, openRiskMinor: 0n };
+    const state = { reserveMinor: 10_000_000n, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n };
     expect(checkBet(99n, state, s)).toMatchObject({ ok: false, reason: 'BELOW_MIN' });
     expect(checkBet(100_001n, state, s)).toMatchObject({ ok: false, reason: 'ABOVE_MAX' });
   });
@@ -123,7 +150,7 @@ describe('reserve limits', () => {
     let reserve = 10_000_000n;
     let seedN = 0;
     for (let i = 0; i < 20_000; i++) {
-      const state = { reserveMinor: reserve, committedMinor: 0n, openRiskMinor: 0n };
+      const state = { reserveMinor: reserve, openBetsMinor: 0n, committedMinor: 0n, openRiskMinor: 0n };
       const limits = currentLimits(state, s);
       if (limits.maxBetMinor < s.minBetMinor) break;
       const bet = limits.maxBetMinor;

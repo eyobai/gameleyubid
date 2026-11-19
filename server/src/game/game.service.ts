@@ -278,12 +278,13 @@ export class GameService {
   /** Reserve balance and what open flights could still take from it. Read under the caller's locks. */
   async reserveState(tx: Tx): Promise<ReserveState> {
     const reserve = await this.ledger.system(tx, AccountType.GAME_RESERVE);
-    const [row] = await tx.$queryRaw<{ committed: bigint; risk: bigint }[]>`
-      SELECT COALESCE(SUM(max_payout_minor), 0)::bigint AS committed,
+    const [row] = await tx.$queryRaw<{ bets: bigint; committed: bigint; risk: bigint }[]>`
+      SELECT COALESCE(SUM(bet_minor), 0)::bigint AS bets,
+             COALESCE(SUM(max_payout_minor), 0)::bigint AS committed,
              COALESCE(SUM(max_payout_minor - bet_minor), 0)::bigint AS risk
       FROM flights WHERE status = 'OPEN'`;
     const fresh = await tx.ledgerAccount.findUniqueOrThrow({ where: { id: reserve.id } });
-    return { reserveMinor: fresh.balanceMinor, committedMinor: row.committed, openRiskMinor: row.risk };
+    return { reserveMinor: fresh.balanceMinor, openBetsMinor: row.bets, committedMinor: row.committed, openRiskMinor: row.risk };
   }
 
   /**

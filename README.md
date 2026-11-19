@@ -93,13 +93,17 @@ The **reserve** is the house bankroll that pays winners. Staff fund it and take 
 
 | Rule | Default | Setting |
 | --- | --- | --- |
-| The most one bet can cost the house (payout − bet), as a share of the free reserve | 1% | `GAME_FLIGHT_RISK_BPS=100` |
+| The most one bet can cost the house (payout − bet), as a share of the reserve | 1% | `GAME_FLIGHT_RISK_BPS=100` |
 | The most all open flights together can cost the house, as a share of the reserve | 10% | `GAME_TOTAL_RISK_BPS=1000` |
 | Highest multiplier anyone is paid at | 1000× | `GAME_MAX_MULTIPLIER_X100=100000` |
 | House edge | 3% | `GAME_EDGE_BPS=300` |
 
 How the limits are applied:
-- **Free reserve:** the reserve minus everything open flights could still win.
+- **What the limits are a share of:** the reserve minus the bets of flights still in the air. Those bets may soon be
+  paid back out, so they don't count. This amount doesn't change while people place bets, so every player gets the
+  same limit until the 10% for all open flights is used up. With a 100,000 reserve, ten 1,000 bets can fly at once.
+- **Free reserve:** the reserve minus everything open flights could still win. A new bet can never be promised more
+  than this, and it's the most a withdrawal can take.
 - **Bet limit:** a bet larger than the current limit is refused (`BET_ABOVE_LIMIT`, with the current maximum).
 - **Cap:** every accepted bet gets a cap, the multiplier where its winnings reach the limit. The flight is paid out
   there automatically, so no payout can exceed what was set aside for it.
