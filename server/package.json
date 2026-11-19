@@ -12,7 +12,8 @@
     "test:e2e": "jest --config ./test/jest-e2e.json --runInBand",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "seed": "ts-node src/scripts/seed-staff.ts"
+    "seed": "ts-node src/scripts/seed-staff.ts",
+    "dev:credit": "ts-node src/scripts/dev-credit.ts"
   },
   "jest": {
     "moduleFileExtensions": [

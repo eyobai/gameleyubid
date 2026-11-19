@@ -1,0 +1,31 @@
+# Local development database:   docker compose up -d
+# Whole app in Docker as well:   docker compose --profile app up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: updraft
+      POSTGRES_PASSWORD: updraft_dev_password
+      POSTGRES_DB: updraft
+    ports: ['5433:5432']
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U updraft']
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    profiles: ['app']
+    restart: unless-stopped
+    env_file: server/.env
+    environment:
+      DATABASE_URL: postgresql://updraft:updraft_dev_password@postgres:5432/updraft?schema=public
+    ports: ['3100:3100']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
